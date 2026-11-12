@@ -230,6 +230,7 @@ class SPGroup:
     backend = None
     # Explicit wait bound for checkpoint collectives; only XCCL needs one (no watchdog).
     bounded_timeout = None
+    command_seq = 0
 
     def __init__(self, world, unet_name, weight_dtype, devices, port=0, backend=None):
         if dist.is_initialized():
@@ -242,6 +243,7 @@ class SPGroup:
         self.n_forward = 0
         self.operation_id = 0
         self.patch_uuid = None
+        self.command_seq = 0
         self.patches_ready = False
         self.verify_pending = False
         self.control_pg = None
@@ -332,6 +334,12 @@ class SPGroup:
             return spdev.CollectiveMonitor(self.procs, self.log_paths, self.collective_timeout)
         return nullcontext()
 
+    def _send_command(self, message):
+        """Broadcast a control command to workers waiting in their command loop."""
+        self.command_seq += 1
+        self.store.set(spdev.command_key(self.command_seq), "1")
+        dist.broadcast_object_list([message], src=0, group=self.control_pg)
+
     def check_alive(self):
         for r, p in enumerate(self.procs, start=1):
             if p.poll() is not None:
@@ -344,15 +352,15 @@ class SPGroup:
         self.check_alive()
         version = patch_sync.patch_version(patcher)
         try:
-            dist.broadcast_object_list([{"op": "prepare", "memory_required": patch_sync.memory_budget(patcher),
-                                         "version": version}], src=0, group=self.control_pg)
+            self._send_command({"op": "prepare", "memory_required": patch_sync.memory_budget(patcher),
+                                "version": version})
             ready = [None] * self.world
             dist.all_gather_object(ready, {"ready": True}, group=self.control_pg)
             if any(reply != {"ready": True} for reply in ready):
                 raise RuntimeError(f"MiniMax SP worker preparation failed: {ready}")
             if version != self.patch_uuid:
                 with patch_sync.export_patches(patcher) as manifest:
-                    dist.broadcast_object_list([manifest.message()], src=0, group=self.control_pg)
+                    self._send_command(manifest.message())
                     replies = [None] * self.world
                     dist.all_gather_object(replies, manifest.ready(0), group=self.control_pg)
                     patch_sync.validate_replies(manifest, replies, self.world)
@@ -384,7 +392,7 @@ class SPGroup:
             meta["operation_id"] = self.operation_id + 1
             meta["denoise_mask"] = tensor_meta(denoise_mask)
             meta["audio_denoise_mask"] = tensor_meta(audio_denoise_mask)
-            dist.broadcast_object_list([meta], src=0, group=self.control_pg)
+            self._send_command(meta)
             expected = forward_status(meta)
             replies = [None] * self.world
             dist.all_gather_object(replies, expected, group=self.control_pg)
@@ -438,7 +446,7 @@ class SPGroup:
         self.patches_ready = False
         try:
             with self._monitor_collectives():
-                dist.broadcast_object_list([{"op": "cleanup"}], src=0, group=self.control_pg)
+                self._send_command({"op": "cleanup"})
                 ready = [None] * self.world
                 dist.all_gather_object(ready, {"ready": True}, group=self.control_pg)
                 if any(reply != {"ready": True} for reply in ready):
@@ -498,7 +506,7 @@ class SPGroup:
         if not self.procs:
             return
         try:
-            dist.broadcast_object_list([{"op": "shutdown"}], src=0, group=self.control_pg)
+            self._send_command({"op": "shutdown"})
         except Exception:
             pass
         for p in self.procs:

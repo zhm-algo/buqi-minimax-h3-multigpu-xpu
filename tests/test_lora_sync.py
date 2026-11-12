@@ -147,6 +147,7 @@ class PatchSyncTests(unittest.TestCase):
     def test_rank0_denies_forward_after_rejected_ack(self):
         group = SPGroup.__new__(SPGroup)
         group.world, group.patch_uuid, group.control_pg = 2, None, None
+        group.store = Mock()
         group.check_alive, group.destroy = Mock(), Mock()
 
         def gather(replies, local, **kwargs):
@@ -175,6 +176,7 @@ class PatchSyncTests(unittest.TestCase):
         self.assertFalse(issubclass(cancelled, Exception))
         group = SPGroup.__new__(SPGroup)
         group.world, group.control_pg, group.tensor_pg = 2, object(), object()
+        group.store = Mock()
         group.patches_ready, group.operation_id, group.verify_pending = True, 0, False
         group.check_alive, group.destroy = Mock(), Mock()
         meta = {"video": None, "audio": None, "timestep": None, "context": None, "tags": None,

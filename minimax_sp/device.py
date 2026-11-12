@@ -222,6 +222,25 @@ def joined_key(rank):
     return f"minimax_sp/joined/{rank}"
 
 
+def command_key(seq):
+    """TCPStore key rank 0 sets before broadcasting control command ``seq``."""
+    return f"minimax_sp/command/{seq}"
+
+
+def wait_for_command(store, seq, max_poll=0.05):
+    """Wait, without a deadline, until rank 0 announces control command ``seq``.
+
+    Gloo applies its process-group timeout to a pending receive, so a worker idling in
+    the control broadcast between prompts would time out and exit. Polling the store has
+    no such deadline and still fails as soon as rank 0's store goes away.
+    """
+    key = command_key(seq)
+    delay = 0.001
+    while not store.check([key]):
+        time.sleep(delay)
+        delay = min(delay * 2, max_poll)
+
+
 def apply_process_env(backend, environ=None):
     environ = os.environ if environ is None else environ
     if backend == CUDA:

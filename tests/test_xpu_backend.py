@@ -456,6 +456,7 @@ class BoundedCollectiveTests(unittest.TestCase):
         self.assertIsNone(group.bounded_timeout)
         group.bounded_timeout = timedelta(seconds=11)
         group.world, group.control_pg, group.tensor_pg = 2, object(), object()
+        group.store = Mock()
         group.patches_ready, group.operation_id, group.verify_pending = True, 0, False
         group.check_alive, group.destroy = Mock(), Mock()
         source = torch.ones(1)

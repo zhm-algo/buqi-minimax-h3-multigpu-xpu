@@ -45,6 +45,7 @@ class SPFailFastTests(unittest.TestCase):
     def test_cleanup_failure_destroys_group_and_denies_another_forward(self):
         group = spg.SPGroup.__new__(spg.SPGroup)
         group.world, group.control_pg = 2, object()
+        group.store = Mock()
         group.patches_ready = True
         group.check_alive, group.destroy = Mock(), Mock()
 
@@ -57,6 +58,29 @@ class SPFailFastTests(unittest.TestCase):
                 group.cleanup()
         self.assertFalse(group.patches_ready)
         group.destroy.assert_called_once_with()
+
+    def test_commands_ring_store_before_control_broadcast(self):
+        group = spg.SPGroup.__new__(spg.SPGroup)
+        group.control_pg, group.store = object(), Mock()
+        order = []
+        group.store.set.side_effect = lambda key, value: order.append(("set", key))
+        with patch.object(spg.dist, "broadcast_object_list",
+                          side_effect=lambda box, **kwargs: order.append(("bcast", box[0]["op"]))):
+            group._send_command({"op": "cleanup"})
+            group._send_command({"op": "shutdown"})
+        self.assertEqual(order, [("set", spg.spdev.command_key(1)), ("bcast", "cleanup"),
+                                 ("set", spg.spdev.command_key(2)), ("bcast", "shutdown")])
+
+    def test_worker_waits_for_command_without_deadline(self):
+        store = Mock()
+        store.check.side_effect = [False, False, True]
+        with patch.object(spg.spdev.time, "sleep") as sleep:
+            spg.spdev.wait_for_command(store, 3)
+        store.check.assert_called_with([spg.spdev.command_key(3)])
+        self.assertEqual(sleep.call_count, 2)
+        store.check.side_effect = RuntimeError("store closed")
+        with self.assertRaisesRegex(RuntimeError, "store closed"):
+            spg.spdev.wait_for_command(store, 4)
 
     def test_timeout_defaults_and_overrides(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -96,6 +120,7 @@ class SPFailFastTests(unittest.TestCase):
         source = torch.ones(1)
         group = spg.SPGroup.__new__(spg.SPGroup)
         group.world, group.control_pg, group.tensor_pg = 2, control_pg, tensor_pg
+        group.store = Mock()
         group.patches_ready, group.operation_id, group.verify_pending = True, 0, False
         group.check_alive, group.destroy = Mock(), Mock()
 
@@ -217,6 +242,7 @@ class SPFailFastTests(unittest.TestCase):
         source = torch.ones(1)
         group = spg.SPGroup.__new__(spg.SPGroup)
         group.world, group.control_pg, group.tensor_pg = 2, control_pg, tensor_pg
+        group.store = Mock()
         group.patches_ready, group.operation_id, group.verify_pending = True, 0, False
         group.check_alive, group.destroy = Mock(), Mock()
 

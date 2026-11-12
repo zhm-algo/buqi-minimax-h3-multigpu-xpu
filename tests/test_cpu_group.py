@@ -6,6 +6,7 @@ here with MINIMAX_SP_BACKEND=cpu so no accelerator is needed.
 """
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -82,6 +83,45 @@ class CPUGroupLifecycleTests(unittest.TestCase):
                     procs = list(group.procs)
                     group.shutdown()
                     self.assertIsNone(sp_group.active_group())
+                    self.assertEqual([p.returncode for p in procs], [0])
+            except Exception:
+                log = os.path.join(tmp, "minimax_sp_worker1.log")
+                if os.path.exists(log):
+                    with open(log, encoding="utf-8", errors="replace") as f:
+                        print("worker log:\n" + f.read()[-4000:])
+                raise
+            finally:
+                if sp_group.active_group() is not None:
+                    sp_group.active_group().destroy()
+                paths.remove(tmp)
+
+    def test_worker_survives_idle_longer_than_control_timeout(self):
+        # Gloo's control timeout follows MINIMAX_SP_STARTUP_TIMEOUT; idling past it used to kill workers.
+        with tempfile.TemporaryDirectory() as tmp:
+            save_tiny_h3(os.path.join(tmp, "tiny_h3.safetensors"))
+            env = {"MINIMAX_SP_BACKEND": "cpu", "MINIMAX_SP_LOGDIR": tmp,
+                   "MINIMAX_SP_STARTUP_TIMEOUT": "30", "MINIMAX_SP_COLLECTIVE_TIMEOUT": "30"}
+            paths = folder_paths.folder_names_and_paths["diffusion_models"][0]
+            paths.append(tmp)
+            try:
+                with patch.dict(os.environ, env):
+                    model = node.MiniMaxH3SPUNETLoader.execute("tiny_h3.safetensors", "default", 2, "auto").result[0]
+                    group = sp_group.active_group()
+                    group.sync_patches(model)
+                    model.cleanup()
+                    time.sleep(35)
+                    group.check_alive()
+                    model.pre_run()
+                    dit = model.get_model_object("diffusion_model")
+                    x = [torch.randn(1, 24, 2, 4, 4), torch.randn(1, 32, 2, 3)]
+                    timestep, context = torch.tensor([500.0]), torch.randn(1, 3, 64)
+                    with torch.no_grad():
+                        expected = type(dit)._forward(dit, x, timestep, context, transformer_options={})
+                        got = group.forward(dit, x, timestep, context, {}, None)
+                    for actual, reference in zip(got, expected):
+                        torch.testing.assert_close(actual, reference, atol=1e-5, rtol=1e-4)
+                    procs = list(group.procs)
+                    group.shutdown()
                     self.assertEqual([p.returncode for p in procs], [0])
             except Exception:
                 log = os.path.join(tmp, "minimax_sp_worker1.log")

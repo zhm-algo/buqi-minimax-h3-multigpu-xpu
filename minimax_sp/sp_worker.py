@@ -192,7 +192,11 @@ def main(a, omnixpu_state=None):
         steps = 0
         previous_operation_id = 0
         patches = WorkerPatches(patcher, a.rank)
+        command_seq = 0
         while True:
+            # Idle time between prompts is unbounded; only enter Gloo once a command is sent.
+            command_seq += 1
+            spdev.wait_for_command(store, command_seq)
             box = [None]
             dist.broadcast_object_list(box, src=0, group=control_pg)
             meta = box[0]
