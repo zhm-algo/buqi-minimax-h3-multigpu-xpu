@@ -2,10 +2,11 @@
 
 Rank 0 is the ComfyUI process itself; ranks 1..P-1 are thin worker processes that
 hold only the DiT and do nothing but sequence-parallel forwards. Each worker gets
-CUDA_VISIBLE_DEVICES=<rank> so ComfyUI's own device plumbing stays untouched.
+its own device mask (CUDA_VISIBLE_DEVICES=<id> on CUDA, ZE_AFFINITY_MASK=<id> on
+Intel XPU) so ComfyUI's own device plumbing stays untouched.
 
 Per step, rank 0 broadcasts a small metadata dict over the Gloo control group and
-the input tensors over a dedicated NCCL group, then all ranks run the identical
+the input tensors over a dedicated NCCL/XCCL group, then all ranks run the identical
 sp_forward. State is sent every step on purpose: no cross-step caching means no
 cache-invalidation class of bugs.
 """
@@ -23,10 +24,13 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
+import comfy.memory_management
 import comfy.model_management
 from comfy.cli_args import args as comfy_args
 import folder_paths
 
+from . import device as spdev
+from . import omnixpu
 from . import sp_forward as spf
 from . import sp_patches as patch_sync
 
@@ -45,6 +49,38 @@ def positive_timeout(name, default):
     if seconds <= 0:
         raise ValueError(f"{name} must be a positive integer number of seconds, got {value!r}")
     return timedelta(seconds=seconds)
+
+
+def worker_runtime_options(backend, omnixpu_state=None):
+    dynamic_vram = getattr(comfy.memory_management, "aimdo_enabled", False)
+    if backend == spdev.XPU:
+        if dynamic_vram and not omnixpu.provider_active(omnixpu_state):
+            raise RuntimeError(
+                "MiniMax SP XPU workers can only reproduce DynamicVRAM through the ComfyUI-OmniXPU "
+                f"{omnixpu.AIMDO_PROVIDER} runtime provider, which is not active in this ComfyUI process. "
+                "Install/enable ComfyUI-OmniXPU with its AIMDO XPU provider, or restart with --disable-dynamic-vram.")
+        if not dynamic_vram and os.environ.get("AIMDO_XPU_ALLOCATOR_MODE", "").strip() == "native_hook":
+            raise RuntimeError(
+                "AIMDO_XPU_ALLOCATOR_MODE=native_hook is set but DynamicVRAM is not active in this ComfyUI "
+                "process, so workers would inherit the native allocator preload without AIMDO. Check the "
+                "ComfyUI startup log for the DynamicVRAM/OmniXPU failure, or unset AIMDO_XPU_ALLOCATOR_MODE "
+                "and its LD_PRELOAD before starting ComfyUI.")
+    runtime = {k: getattr(comfy_args, k) for k in (
+        "force_fp16", "fp16_unet", "fp32_unet", "bf16_unet", "disable_dynamic_vram",
+        "disable_comfy_compiler", "disable_cuda_graphs", "use_pytorch_cross_attention",
+        "disable_triton_backend", "highvram", "lowvram", "reserve_vram",
+        "vram_headroom", "disable_nvml_pressure")}
+    if backend == spdev.XPU:
+        # Follow rank 0's actual DynamicVRAM state. An explicit enable flag overrides disable
+        # in ComfyUI, and OmniXPU only reads the enable flag, so set both.
+        runtime["enable_dynamic_vram"] = bool(dynamic_vram)
+        runtime["disable_dynamic_vram"] = not dynamic_vram
+    elif backend != spdev.CUDA and not dynamic_vram:
+        runtime["enable_dynamic_vram"] = False
+        runtime["disable_dynamic_vram"] = True
+    if backend == spdev.CPU:
+        runtime["cpu"] = True
+    return runtime
 
 
 def tensor_meta(t):
@@ -96,21 +132,26 @@ def validate_operation_id(operation_id, previous):
         raise RuntimeError(f"MiniMax SP worker expected operation_id {expected}, got {operation_id}")
 
 
-def startup_probe(rank, world, tensor_pg, device):
+def startup_probe(rank, world, tensor_pg, device, timeout=None):
     try:
         reduced = torch.tensor([rank + 1], dtype=torch.float32, device=device)
-        dist.all_reduce(reduced, group=tensor_pg)
+        spdev.run_collective(dist.all_reduce, reduced, group=tensor_pg, timeout=timeout)
         expected_sum = world * (world + 1) / 2
         if reduced.item() != expected_sum:
             raise RuntimeError(f"all_reduce returned {reduced.item()}, expected {expected_sum}")
 
         source = torch.arange(world, dtype=torch.int64, device=device) + rank * world
         received = torch.empty_like(source)
-        dist.all_to_all_single(received, source, group=tensor_pg)
+        spdev.run_collective(dist.all_to_all_single, received, source, group=tensor_pg, timeout=timeout)
         expected = torch.arange(world, dtype=torch.int64, device=device) * world + rank
         if not torch.equal(received, expected):
             raise RuntimeError(f"all_to_all_single returned {received.tolist()}, expected {expected.tolist()}")
     except Exception as exc:
+        if torch.device(device).type == "xpu":
+            raise RuntimeError(
+                "MiniMax SP XCCL startup probe failed; check per-worker XPU visibility (ZE_AFFINITY_MASK, "
+                "ONEAPI_DEVICE_SELECTOR, MINIMAX_SP_XPU_VISIBILITY), PCIe P2P between the cards (ACS/IOMMU), "
+                f"and oneCCL logs (set CCL_LOG_LEVEL=info): {exc}") from exc
         raise RuntimeError(
             "MiniMax SP NCCL startup probe failed; check per-worker GPU visibility, GPU P2P support, "
             f"and NCCL logs (set NCCL_DEBUG=INFO): {exc}") from exc
@@ -185,11 +226,16 @@ def ordered_tensors(x, timestep, context, transformer_options, payload):
 
 
 class SPGroup:
-    def __init__(self, world, unet_name, weight_dtype, devices, port=0):
+    backend = None
+    # Explicit wait bound for checkpoint collectives; only XCCL needs one (no watchdog).
+    bounded_timeout = None
+
+    def __init__(self, world, unet_name, weight_dtype, devices, port=0, backend=None):
         if dist.is_initialized():
             raise RuntimeError("MiniMax SP cannot adopt an existing process group; use a separate ComfyUI process")
         self.world = world
         self.unet_name = unet_name
+        self.backend = backend
         self.procs = []
         self.log_paths = {}
         self.n_forward = 0
@@ -205,30 +251,32 @@ class SPGroup:
         self.collective_timeout = positive_timeout("MINIMAX_SP_COLLECTIVE_TIMEOUT", 120)
         try:
             self._start(world, unet_name, weight_dtype, devices, port)
-        except (Exception, comfy.model_management.InterruptProcessingException):
+        except comfy.model_management.InterruptProcessingException:
             self.destroy()
+            raise
+        except Exception as exc:
+            self.destroy()
+            if self.log_paths:
+                logs = "; ".join(f"rank {rank}: {path}" for rank, path in self.log_paths.items())
+                raise RuntimeError(f"MiniMax SP startup failed: {exc}. Worker logs: {logs}") from exc
             raise
 
     def _start(self, world, unet_name, weight_dtype, devices, port):
+        backend = self.backend = self.backend or spdev.select_backend()
+        spdev.check_available(backend)
+        omnixpu_state = omnixpu.rank0_state() if backend == spdev.XPU else None
+        runtime = worker_runtime_options(backend, omnixpu_state)
         # A fresh store avoids reusing stale rendezvous keys after cancellation.
         # Bind port 0 before spawning, rather than probing/releasing a free port.
         self.store = dist.TCPStore("127.0.0.1", port, world, True,
                                    timeout=self.startup_timeout, wait_for_workers=False)
         port = self.store.port
         comfy_root = os.path.dirname(os.path.abspath(folder_paths.__file__))
-        runtime = {k: getattr(comfy_args, k) for k in (
-            "force_fp16", "fp16_unet", "fp32_unet", "bf16_unet", "disable_dynamic_vram",
-            "disable_comfy_compiler", "disable_cuda_graphs", "use_pytorch_cross_attention",
-            "disable_triton_backend", "highvram", "lowvram", "reserve_vram",
-            "vram_headroom", "disable_nvml_pressure")}
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sp_worker.py")
         log_dir = os.environ.get("MINIMAX_SP_LOGDIR") or tempfile.gettempdir()
         for r in range(1, world):
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = devices[r]
+            env, local_device = spdev.worker_env(backend, os.environ, devices[r])
             env["PYTHONPATH"] = comfy_root + os.pathsep + env.get("PYTHONPATH", "")
-            env["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
-            env["TORCH_NCCL_BLOCKING_WAIT"] = "1"
             log_path = os.path.join(log_dir, f"minimax_sp_worker{r}.log")
             self.log_paths[r] = log_path
             with open(log_path, "w") as log:
@@ -238,17 +286,19 @@ class SPGroup:
                      "--weight-dtype", weight_dtype, "--comfy-root", comfy_root,
                      "--startup-timeout", str(int(self.startup_timeout.total_seconds())),
                      "--collective-timeout", str(int(self.collective_timeout.total_seconds())),
-                     "--runtime-options", json.dumps(runtime)],
+                     "--runtime-options", json.dumps(runtime),
+                     "--omnixpu", json.dumps(omnixpu_state),
+                     "--backend", backend.name, "--local-device", str(local_device)],
                     env=env, stdout=log, stderr=log, cwd=comfy_root))
-            logging.info(f"[minimax_sp] spawned worker rank {r} on physical GPU {devices[r]}")
+            logging.info(f"[minimax_sp] spawned worker rank {r} on physical GPU {devices[r]} "
+                         f"({backend.label}); log: {log_path}")
 
-        os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
-        os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
-        dist.init_process_group("gloo", store=self.store, rank=0, world_size=world,
-                                timeout=self.startup_timeout)
+        self._wait_for_workers_to_join()
+        spdev.apply_process_env(backend)
+        self.control_pg, self.tensor_pg = spdev.init_groups(
+            backend, self.store, 0, world, self.startup_timeout, self.collective_timeout)
         self._owns_default_pg = True
-        self.control_pg = dist.group.WORLD
-        self.tensor_pg = dist.new_group(backend="nccl", timeout=self.collective_timeout)
+        self.bounded_timeout = spdev.bounded_timeout(backend, self.collective_timeout)
         logging.info("[minimax_sp] process groups up, waiting for workers to load weights...")
         loaded = [None] * world
         dist.all_gather_object(loaded, {"loaded": True}, group=self.control_pg)
@@ -258,8 +308,22 @@ class SPGroup:
         logging.info(f"[minimax_sp] all {world} ranks ready")
         atexit.register(self.shutdown)
 
+    def _wait_for_workers_to_join(self):
+        # Workers import ComfyUI and replay OmniXPU prestartup before the rendezvous; report an
+        # early exit right away instead of blocking in init_process_group until the timeout.
+        keys = [spdev.joined_key(r) for r in range(1, self.world)]
+        deadline = time.monotonic() + self.startup_timeout.total_seconds()
+        while not self.store.check(keys):
+            for r, p in enumerate(self.procs, start=1):
+                if p.poll() is not None:
+                    raise RuntimeError(f"worker rank {r} exited with code {p.returncode} before joining")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"MiniMax SP workers did not join within {self.startup_timeout}")
+            time.sleep(0.2)
+
     def _startup_probe(self):
-        startup_probe(0, self.world, self.tensor_pg, torch.device("cuda", 0))
+        startup_probe(0, self.world, self.tensor_pg, spdev.rank0_device(self.backend or spdev.CUDA),
+                      self.bounded_timeout)
 
     def check_alive(self):
         for r, p in enumerate(self.procs, start=1):
@@ -321,10 +385,11 @@ class SPGroup:
                 if t is not None:
                     dist.broadcast(t.to(device).contiguous(), src=0, group=self.tensor_pg)
             if profile:
-                torch.cuda.synchronize()
+                spdev.synchronize(device)
             t0 = time.perf_counter()
             out = spf.sp_forward(dit, x, timestep, context, transformer_options, payload,
-                                 0, self.world, self.tensor_pg, denoise_mask, audio_denoise_mask)
+                                 0, self.world, self.tensor_pg, denoise_mask, audio_denoise_mask,
+                                 collective_timeout=self.bounded_timeout)
             if self.verify_pending:
                 # Verification only: compare the actual loaded ranks to native H3 before accepting a step.
                 reference = type(dit)._forward(dit, x, timestep, context, transformer_options.copy(),
@@ -338,7 +403,7 @@ class SPGroup:
                         raise RuntimeError(f"[minimax_sp] {label} differs from native H3: relative={relative}")
                 self.verify_pending = False
             if profile:
-                torch.cuda.synchronize()
+                spdev.synchronize(device)
                 logging.info(f"[minimax_sp][profile] step {self.n_forward}: "
                              f"meta_bcast={1000 * (t_meta - t_disp):.1f}ms "
                              f"tensor_bcast={1000 * (t0 - t_meta):.1f}ms "
@@ -369,20 +434,16 @@ class SPGroup:
         owns_default = getattr(self, "_owns_default_pg", False)
         initialized = dist.is_initialized()
         try:
-            if initialized and tensor_pg is not None:
-                dist.destroy_process_group(tensor_pg)
+            if initialized:
+                spdev.destroy_groups(self.backend, control_pg, tensor_pg, owns_default)
         finally:
             self.tensor_pg = None
-            try:
-                if initialized and owns_default and control_pg is not None:
-                    dist.destroy_process_group(control_pg)
-            finally:
-                self.control_pg = None
-                self._owns_default_pg = False
-                self.store = None
-                for key, group in list(_GROUPS.items()):
-                    if group is self:
-                        del _GROUPS[key]
+            self.control_pg = None
+            self._owns_default_pg = False
+            self.store = None
+            for key, group in list(_GROUPS.items()):
+                if group is self:
+                    del _GROUPS[key]
 
     def shutdown(self):
         if not self.procs:
@@ -404,7 +465,7 @@ def active_group():
     return next(iter(_GROUPS.values()), None)
 
 
-def get_group(world, unet_name, weight_dtype, devices=None):
+def get_group(world, unet_name, weight_dtype, devices=None, backend=None):
     key = (world, unet_name, weight_dtype, tuple(devices) if devices else None)
     if key not in _GROUPS:
         if _GROUPS:
@@ -412,5 +473,5 @@ def get_group(world, unet_name, weight_dtype, devices=None):
                                f"to change it (active: {list(_GROUPS)[0]})")
         if devices is None:
             raise ValueError("[minimax_sp] devices must be provided for a new SP group")
-        _GROUPS[key] = SPGroup(world, unet_name, weight_dtype, devices)
+        _GROUPS[key] = SPGroup(world, unet_name, weight_dtype, devices, backend=backend)
     return _GROUPS[key]

@@ -2,14 +2,14 @@
 
 [English](README.md) | **中文** | [日本語](README_ja.md)
 
-用于 ComfyUI MiniMax H3 的 Ulysses 序列并行多 NVIDIA GPU 加载器。
+用于 ComfyUI MiniMax H3 的 Ulysses 序列并行多卡加载器，支持多张 NVIDIA GPU 或 Intel Arc Pro B70（XPU）。
 
 ## 兼容性与验证范围
 
 - 要求 ComfyUI commit **`8d534945`** 或之后引入的 MiniMax H3 API；启动时由能力检查判断，不声明精确 release tag 范围。
 - 已测试当前 ComfyUI 0.37 开发提交：**`7fbcfa8be9a8f47cf905ec47978b5bd754959ea7`**。
 - ComfyUI 0.30 接口只属于旧版本；main 不再声明兼容。
-- 支持 Linux 或 WSL2，并要求 PyTorch/NCCL；不支持原生 Windows 多卡。
+- NVIDIA：Linux 或 WSL2 + PyTorch/NCCL；Intel：Linux + 带 XCCL 的 PyTorch XPU 版本（见 [Intel Arc Pro B70](#intel-arc-pro-b70xpu)）。不支持原生 Windows 多卡。
 - `world_size` 必须整除 56 个注意力头：**1、2、4、7、8**。
 
 CPU 测试覆盖安装发现、当前 H3 API 契约、fail-fast、patch 同步和双进程 Gloo parity。当前提交的真实 GPU 能力仍需在目标机器运行手动 GPU 验收；CPU 通过不等于 GPU 性能已验证。
@@ -78,6 +78,66 @@ MINIMAX_SP_DEVICES=0,1 python main.py --cuda-device 0,1 --highvram
 
 `devices="auto"` 优先读取 `MINIMAX_SP_DEVICES`，否则读取 `CUDA_VISIBLE_DEVICES` 中的物理 ID（包括 `--cuda-device 2,3` 写入的值），不会误用逻辑重编号后的 `0,1`。显式映射必须唯一、数量恰好等于 `world_size`、全部来自当前可见物理列表，且第一项与 ComfyUI 主卡一致。`world_size=1` 为普通单卡加载。
 
+## Intel Arc Pro B70（XPU）
+
+Intel 显卡使用 PyTorch XPU + XCCL（oneCCL）后端；NVIDIA/NCCL 路径保持不变。后端自动选择（先 CUDA，再 Intel XPU），也可用 `MINIMAX_SP_BACKEND=xpu` 强制指定。
+
+> **状态：** T2V 已在两张通过 PCIe 互连的 Arc Pro B70 上端到端验证（ComfyUI 0.39.0、PyTorch 2.14.0+xpu、INT8 H3 checkpoint、ComfyUI-OmniXPU + `--enable-dynamic-vram`）。双卡视频与单卡视频画面一致，像素差异来自 INT8 kernel 舍入（见“验证命令”）。每步采样时间（单卡 → 双卡）：832×480×25 帧 1.17 → 0.85 s/it（1.4×），832×480×97 帧 4.43 → 2.64 s/it（1.7×），1280×720×97 帧 16.6 → 9.0 s/it（1.8×）。其他工作流目前只有 CPU/mock 测试覆盖；正式使用前请先在目标机器上运行下方 XPU 验收命令。
+
+要求：
+
+- Linux。XCCL 只包含在 Linux 版 PyTorch XPU 中；原生 Windows 会被拒绝。
+- 带 XCCL 的 PyTorch XPU，推荐 PyTorch 2.13+：`python -c "import torch, torch.distributed as d; print(torch.xpu.device_count(), d.is_xccl_available())"` 应输出 ≥2 张卡和 `True`。
+- 支持 Arc Pro B70（Battlemage）的较新内核与 Intel GPU 驱动/compute-runtime，按 Intel 官方对应发行版的驱动安装指南安装。
+- ComfyUI H3 API 要求同上。
+
+双卡 B70：
+
+```bash
+cd /path/to/ComfyUI
+ZE_AFFINITY_MASK=0,1 MINIMAX_SP_DEVICES=0,1 python main.py
+```
+
+- 设备 ID 是 `ZE_AFFINITY_MASK` 使用的 Level Zero 序号。请在未设置 mask 时用 `sycl-ls` 查看；有核显时编号可能后移（此时改用如 `ZE_AFFINITY_MASK=1,2 MINIMAX_SP_DEVICES=1,2`）。与 `CUDA_VISIBLE_DEVICES` 不同，mask 中的书写顺序不会改变设备顺序：ComfyUI 主卡始终是可见序号最小的那张，`MINIMAX_SP_DEVICES` 必须以它开头。也可用 `--oneapi-device-selector level_zero:0,1`，但只接受简单的 `level_zero:<ids>`（或 `level_zero:*`）形式。
+- worker 跟随 rank 0 的 DynamicVRAM 状态。XPU DynamicVRAM（`--enable-dynamic-vram`）需通过 [ComfyUI-OmniXPU](https://github.com/intel/llm-scaler/tree/main/omni/ComfyUI-OmniXPU) 的 `comfy_aimdo.xpu` runtime provider 使用。每个 worker 继承 rank 0 的环境（`AIMDO_XPU_ALLOCATOR_MODE`、`LD_PRELOAD`、`OMNIXPU_*`），按 ComfyUI 的启动顺序：在导入 PyTorch 前执行 OmniXPU 的 `prestartup_script.py`，在自己的卡上初始化 AIMDO，再加载 OmniXPU adapter。若 worker 的活动 runtime provider 与 rank 0 不一致，启动会报错；adapter 的差异（例如只在 rank 0 运行的 SeedVR2/VAE 预处理 adapter）只在 worker 日志中给出警告。rank 0 开启了 XPU DynamicVRAM 但没有该 provider 时，会在启动 worker 前拒绝。关闭 DynamicVRAM（`--disable-dynamic-vram`，或未安装 OmniXPU）时，worker 使用普通 ComfyUI 显存管理；只要装了 OmniXPU，worker 仍会重放其 provider 和 adapter，保证各 rank 使用相同 XPU kernel。NVIDIA 的 DynamicVRAM 行为不变。
+- 初次运行不要加 `--highvram`：rank 0 还承载文本编码器和 VAE，应让 ComfyUI 自行 offload。
+- 先用 FP8-scaled checkpoint 验证；量化格式能否运行取决于你的 ComfyUI/PyTorch 中的 XPU kernel。
+
+**OmniXPU/容器入口脚本**（如 llm-scaler 的 `start_comfyui.sh`）：保持默认的 `--enable-dynamic-vram`，由入口脚本设置 `native_hook` 分配器及其 `LD_PRELOAD`，worker 会自动继承。若要关闭 DynamicVRAM，需向 entrypoint 传入 `--disable-dynamic-vram`，并确保 shell/容器环境中没有 `AIMDO_XPU_ALLOCATOR_MODE=native_hook`，同时从 `LD_PRELOAD` 去掉 `aimdo_xpu.so`。否则 ComfyUI 会报 `[OmniXPU] explicit native_hook requires a compatible AIMDO provider and DynamicVRAM`（入口脚本则输出 `native_hook requires DynamicVRAM`）并退出。
+
+启动失败时，请检查异常中给出的 worker 日志，而不只是 Gloo 堆栈。日志默认在系统临时目录（Linux 通常为 `/tmp/minimax_sp_worker1.log`），也可用 `MINIMAX_SP_LOGDIR` 指定；重试前先保存，下一次启动会覆盖。worker 在加入进程组前退出（例如 OmniXPU prestartup 失败）时会立即报告退出码。若 worker 日志出现 `Could not autodetect AIMDO implementation, assuming Nvidia`，说明该 worker 未应用 OmniXPU provider，请确认 rank 0 的 ComfyUI 日志中 OmniXPU 已加载其 provider。
+
+worker 可见性（`MINIMAX_SP_XPU_VISIBILITY`）：
+
+| 模式 | 行为 |
+|---|---|
+| `shared`（默认） | worker 继承 ComfyUI 的可见性并按序号选卡；所有 SP 卡都必须对 ComfyUI 可见（如 `ZE_AFFINITY_MASK=0,1`）。 |
+| `isolated` | 每个 worker 以 `ZE_AFFINITY_MASK=<自己的卡>` 启动，与 CUDA 设计一致，ComfyUI 只需看到 rank 0 的卡。不推荐：在 Arc Pro B70 + PyTorch 2.14 XCCL 上，各 rank 的 mask 不同时 oneCCL 无法映射设备（worker 日志出现 `comm_dev_uuids is not sub-vector of node_dev_uuids`），第一次 all-to-all 会卡死。 |
+
+进程组：XPU 上 XCCL tensor 组是默认进程组，Gloo 控制面是子组。CUDA 的布局（Gloo 默认组 + NCCL 子组）在 B70 上会让 XCCL 的第一个 collective 卡死。
+
+超时：XCCL 没有 NCCL 那样的 watchdog，因此 XPU 上 startup probe 和每次 forward 最后的 gather 会用 `MINIMAX_SP_COLLECTIVE_TIMEOUT` 显式限时等待。同一 forward 的 collective 在同一 stream 上顺序执行，所以也能发现前面 all-to-all 的卡死。计时从最后的 gather 入队开始，必须大于当前分辨率下一次 DiT forward 的耗时（默认 120 秒）。超时的 XCCL collective 仍留在卡上的队列中，ComfyUI 自身的清理（`torch.xpu.synchronize`）可能在报错后阻塞；XCCL 超时后请重启 ComfyUI。
+
+XPU 验收：
+
+```bash
+COMFYUI_ROOT=/path/to/ComfyUI torchrun --standalone --nproc-per-node=2 \
+  tests/latent_parity.py --backend xpu --unet minimax_h3_fl2va_pruned_fp8_scaled.safetensors
+MINIMAX_SP_BACKEND=xpu COMFYUI_ROOT=/path/to/ComfyUI python tests/runtime_recovery.py \
+  --unet minimax_h3_fl2va_pruned_fp8_scaled.safetensors --devices auto
+```
+
+如果 XPU 上 `latent_parity` 失败，先定位偏差来源再改代码：
+
+```bash
+COMFYUI_ROOT=/path/to/ComfyUI torchrun --standalone --nproc-per-node=2 \
+  tests/sp_diagnose.py --backend xpu --unet <同一个 checkpoint>
+```
+
+它会逐位校验 SP 的 collective，并在卡上跑一个随机初始化的小型 H3（float32）。加 `--unet` 时还会检查真实模型 kernel 的形状不变性，并把 SP 偏差与模型自身的 ±1 eps 噪声基线、以及 float32 下的同一偏差做对比。collective 不一致说明是 XCCL/oneCCL 问题；小模型 float32 失败说明是 SP 逻辑问题。若两者都正常，偏差来自舍入结果随行数或 head 数变化的 XPU kernel，SP 在该平台上无法逐位一致，应以噪声基线和端到端生成结果来判断。
+
+手动 GPU 验收 workflow 选择 `backend=xpu` 时，会在带 `xpu` 标签的 self-hosted runner 上执行相同步骤。
+
 ## 示例
 
 | 文件 | 格式/用途 |
@@ -122,17 +182,20 @@ COMFYUI_ROOT=/path/to/ComfyUI python tests/runtime_recovery.py \
 
 | 环境变量 | 默认 | 作用 |
 |---|---:|---|
-| `MINIMAX_SP_DEVICES` | `CUDA_VISIBLE_DEVICES` | `devices=auto` 的可选物理设备映射 |
+| `MINIMAX_SP_DEVICES` | `CUDA_VISIBLE_DEVICES` / `ZE_AFFINITY_MASK` | `devices=auto` 的可选物理设备映射 |
+| `MINIMAX_SP_BACKEND` | `auto` | `auto`（先 CUDA 再 Intel XPU）、`cuda` 或 `xpu`；`cpu` 仅用于测试 |
+| `MINIMAX_SP_XPU_VISIBILITY` | `shared` | Intel XPU worker 可见性：`shared` 或 `isolated` |
 | `MINIMAX_SP_STARTUP_TIMEOUT` | 300 秒 | worker/进程组启动超时 |
-| `MINIMAX_SP_COLLECTIVE_TIMEOUT` | 120 秒 | NCCL collective 超时 |
+| `MINIMAX_SP_COLLECTIVE_TIMEOUT` | 120 秒 | NCCL collective 超时；Intel XPU 上为 startup probe 和每次 forward 最终 gather 的等待上限 |
 | `MINIMAX_SP_LOGDIR` | 系统临时目录 | `minimax_sp_worker<N>.log` 所在目录 |
 | `MINIMAX_SP_VERIFY=1` | 关闭 | 首次 SP 输出与原生 H3 对比后才接受 |
 | `MINIMAX_SP_PROFILE=1` | 关闭 | forward 耗时 |
 | `MINIMAX_SP_PROFILE_OPS=1` | 关闭 | 分区耗时 |
 
 - **clone 后没有节点**：确认仓库目录本身位于 `custom_nodes`，根目录有 `__init__.py`，查看 ComfyUI 启动 traceback。
-- **原生 Windows 报错**：改用 WSL2 或 Linux，SP 需要 NCCL。
+- **原生 Windows 报错**：改用 WSL2 或 Linux，SP 需要 NCCL；Intel XPU 多卡需要 Linux。
 - **GPU visibility/P2P/startup probe 失败**：检查 `--cuda-device`、`MINIMAX_SP_DEVICES`、`nvidia-smi` 与 NCCL/P2P。只有确实加载较慢时才提高 startup timeout。
+- **XCCL startup probe 失败（Intel XPU）**：对照 `sycl-ls` 检查 `ZE_AFFINITY_MASK`/`ONEAPI_DEVICE_SELECTOR`/`MINIMAX_SP_DEVICES`，保持默认的 `MINIMAX_SP_XPU_VISIBILITY=shared`（worker 日志中的 `comm_dev_uuids is not sub-vector` 警告表示各 rank 看到的卡不同），确认卡间 PCIe P2P 未被 ACS/IOMMU 设置阻断，并用 `CCL_LOG_LEVEL=info` 重跑。多 Arc 系统上有报告称以下 oneCCL 设置有帮助，请逐个尝试：`CCL_ZE_IPC_EXCHANGE=sockets`、`CCL_TOPO_P2P_ACCESS=0`（关闭 P2P，较慢）、`CCL_ENABLE_SYCL_KERNELS=0`、`SYCL_UR_USE_LEVEL_ZERO_V2=0`。probe 超时后请重启 ComfyUI。
 - **collective timeout/worker 退出**：查看 `MINIMAX_SP_LOGDIR` 中每个 rank 的日志；先修复 OOM、设备映射或不支持 patch，不要只反复加大 timeout。
 - **VAE 节点 deprecated warning**：把 `MiniMaxH3SPVAEDecode` 替换为标准 `VAEDecode`；两者现在都走官方解码。
 - **更换 checkpoint/dtype/world size**：重启 ComfyUI 后再建新 SP 组。

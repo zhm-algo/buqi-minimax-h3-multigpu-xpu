@@ -6,6 +6,7 @@ the reference on rank 0 and the all-to-all sequence-parallel forward on all rank
 then reports max absolute deviation.
 
     torchrun --nproc_per_node=2 tests/latent_parity.py --unet <file.safetensors>
+    torchrun --nproc_per_node=2 tests/latent_parity.py --backend xpu --unet <file.safetensors>
 """
 import argparse
 import os
@@ -49,14 +50,25 @@ def main():
     ap.add_argument("--text-len", type=int, default=64)
     ap.add_argument("--atol", type=float, default=1e-4)
     ap.add_argument("--rtol", type=float, default=1e-3)
+    ap.add_argument("--backend", choices=("auto", "cuda", "xpu"), default="auto",
+                    help="auto uses CUDA when available, otherwise Intel XPU (XCCL)")
     args = ap.parse_args()
     configure_imports(args.comfyui_root)
 
-    dist.init_process_group("nccl", timeout=timedelta(minutes=40),
-                            device_id=torch.device("cuda", int(os.environ["LOCAL_RANK"])))
+    local_rank = int(os.environ["LOCAL_RANK"])
+    backend = args.backend
+    if backend == "auto":
+        backend = "cuda" if torch.cuda.is_available() else "xpu"
+    if backend == "cuda":
+        dist.init_process_group("nccl", timeout=timedelta(minutes=40),
+                                device_id=torch.device("cuda", local_rank))
+        torch.cuda.set_device(local_rank)
+    else:
+        # Bind the device before ComfyUI import: model_management picks the current XPU.
+        torch.xpu.set_device(local_rank)
+        dist.init_process_group("xccl", timeout=timedelta(minutes=40))
     rank, world = dist.get_rank(), dist.get_world_size()
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    device = torch.device(backend, local_rank)
 
     import comfy.model_management
     import comfy.sd
@@ -87,12 +99,16 @@ def main():
             delta = (actual - expected).abs()
             max_abs = delta.max().item()
             relative = max_abs / max(expected.abs().max().item(), 1e-12)
+            rel_l2 = (delta.norm() / expected.norm().clamp_min(1e-12)).item()
+            cos = torch.nn.functional.cosine_similarity(actual.flatten(), expected.flatten(), dim=0).item()
             close = torch.allclose(actual, expected, atol=args.atol, rtol=args.rtol)
             failed |= not close
             print(f"  vs 1gpu  all_to_all {label:<5} max_abs={max_abs:.3e} "
-                  f"rel={relative:.3e} close={close} exact={torch.equal(actual, expected)} "
-                  f"nonzero={int((delta > 0).sum())}/{delta.numel()}")
+                  f"rel={relative:.3e} rel_l2={rel_l2:.3e} cos={cos:.6f} close={close} "
+                  f"exact={torch.equal(actual, expected)} nonzero={int((delta > 0).sum())}/{delta.numel()}")
         print("FAIL: latent parity exceeded tolerance" if failed else "PASS: latent parity within tolerance")
+        if failed:
+            print("  To attribute the drift (communication, SP logic, or kernel rounding), run tests/sp_diagnose.py.")
     dist.destroy_process_group()
     return 1 if rank == 0 and failed else 0
 

@@ -1,0 +1,311 @@
+"""Accelerator backends for the MiniMax-H3 sequence-parallel group.
+
+CUDA keeps the original design: NCCL tensor group, one CUDA_VISIBLE_DEVICES id per
+worker. Intel XPU (Arc Pro B60/B70, Data Center GPU Max) uses XCCL/oneCCL and Level
+Zero device masks. CPU/Gloo exists only so the full worker lifecycle can be tested
+on machines without accelerators.
+
+This module only depends on torch so the worker can load it before ComfyUI.
+"""
+
+import os
+from typing import NamedTuple
+
+import torch
+import torch.distributed as dist
+
+XPU_VISIBILITY_MODES = ("isolated", "shared")
+
+
+class Backend(NamedTuple):
+    # Value semantics on purpose: the worker loads this module separately from the package.
+    name: str  # torch device type
+    dist_backend: str
+    label: str
+    visible_env: str | None
+    # XCCL has no watchdog and plain waits never time out, so XPU collectives are
+    # bounded explicitly at checkpoints (see run_collective).
+    bounded_waits: bool
+    # On Arc Pro B70 (PyTorch 2.14 XCCL) a communicator created with new_group under a
+    # Gloo default group hangs in its first collective, so XPU makes the tensor group the
+    # default and puts the Gloo control plane in the subgroup instead (see init_groups).
+    tensor_group_is_default: bool = False
+
+
+CUDA = Backend("cuda", "nccl", "NCCL", "CUDA_VISIBLE_DEVICES", False)
+XPU = Backend("xpu", "xccl", "XCCL", "ZE_AFFINITY_MASK", True, True)
+CPU = Backend("cpu", "gloo", "Gloo", None, False)
+BACKENDS = {backend.name: backend for backend in (CUDA, XPU, CPU)}
+
+
+def get_backend(name):
+    try:
+        return BACKENDS[name]
+    except KeyError:
+        raise ValueError(f"unknown MiniMax SP backend {name!r}; expected one of {', '.join(BACKENDS)}") from None
+
+
+def xpu_is_available():
+    xpu = getattr(torch, "xpu", None)
+    try:
+        return xpu is not None and xpu.is_available()
+    except Exception:
+        return False
+
+
+def select_backend(name=None):
+    """Pick the tensor backend: MINIMAX_SP_BACKEND, else the accelerator PyTorch exposes."""
+    name = (name or os.environ.get("MINIMAX_SP_BACKEND") or "auto").strip().lower()
+    if name != "auto":
+        return get_backend(name)
+    if torch.cuda.is_available():
+        return CUDA
+    if xpu_is_available():
+        return XPU
+    raise RuntimeError("MiniMax SP needs CUDA or Intel XPU devices, but PyTorch sees neither; "
+                       "install a CUDA or XPU build of PyTorch")
+
+
+def check_available(backend):
+    if backend == XPU:
+        if not getattr(dist, "is_xccl_available", lambda: False)():
+            raise RuntimeError("this PyTorch build has no XCCL backend; Intel XPU multi-GPU SP needs a Linux "
+                               "PyTorch XPU build with XCCL (oneCCL), e.g. torch 2.13+xpu")
+    elif backend == CUDA and not dist.is_nccl_available():
+        raise RuntimeError("this PyTorch build has no NCCL backend; CUDA multi-GPU SP needs NCCL")
+
+
+def platform_error(backend, platform):
+    """Return why native Windows cannot host the tensor group, or None."""
+    if platform != "win32":
+        return None
+    if backend == CUDA:
+        return ("multi-GPU SP needs NCCL, which is not available on native Windows; "
+                "run ComfyUI inside WSL2 or on Linux")
+    if backend == XPU:
+        return ("multi-GPU SP on Intel XPU needs XCCL (oneCCL), which PyTorch only ships for Linux; "
+                "run ComfyUI on Linux")
+    return None
+
+
+def xpu_visibility_mode(environ=None):
+    environ = os.environ if environ is None else environ
+    # oneCCL cannot map ranks whose Level Zero masks differ (all_to_all hangs on B70), so
+    # workers keep ComfyUI's visibility by default.
+    mode = environ.get("MINIMAX_SP_XPU_VISIBILITY", "shared").strip().lower()
+    if mode not in XPU_VISIBILITY_MODES:
+        raise ValueError(f"MINIMAX_SP_XPU_VISIBILITY must be one of {', '.join(XPU_VISIBILITY_MODES)}, got {mode!r}")
+    return mode
+
+
+def parse_device_list(value, source, kind="CUDA"):
+    picked = [item.strip() for item in value.split(",")]
+    if not picked or any(not item for item in picked):
+        raise ValueError(f"{source} must be a comma-separated list of {kind} device identifiers")
+    if len(set(picked)) != len(picked):
+        raise ValueError(f"{source} contains duplicate {kind} devices: {value}")
+    return picked
+
+
+def parse_xpu_ids(value, source):
+    picked = parse_device_list(value, source, "XPU")
+    bad = [item for item in picked if not item.isdigit()]
+    if bad:
+        raise ValueError(f"{source} must list whole Level Zero device indices such as 0,1 "
+                         f"(sub-devices and other syntax are not supported): {bad}")
+    return picked
+
+
+def _oneapi_selector_ids(value):
+    """Device indices from a simple ONEAPI_DEVICE_SELECTOR, or None for all devices."""
+    selector = value.strip()
+    backend, sep, ids = selector.partition(":")
+    if sep and backend.strip().lower() == "level_zero":
+        ids = ids.strip()
+        if ids.lower() in ("*", "gpu"):
+            return None
+        if ";" not in ids and "!" not in ids:
+            return parse_xpu_ids(ids, "ONEAPI_DEVICE_SELECTOR")
+    raise ValueError(f"unsupported ONEAPI_DEVICE_SELECTOR {value!r} for MiniMax SP; use the simple form "
+                     "level_zero:0,1 (or set ZE_AFFINITY_MASK=0,1 instead)")
+
+
+def visible_devices(backend, environ=None):
+    """(source, physical ids visible to this process) or (None, None) if unrestricted."""
+    environ = os.environ if environ is None else environ
+    if backend == CUDA:
+        value = environ.get("CUDA_VISIBLE_DEVICES")
+        if value is None:
+            return None, None
+        visible = parse_device_list(value, "CUDA_VISIBLE_DEVICES")
+        if visible == ["-1"]:
+            raise ValueError("CUDA_VISIBLE_DEVICES exposes no CUDA devices")
+        return "CUDA_VISIBLE_DEVICES", visible
+    if backend == XPU:
+        mask_value = environ.get("ZE_AFFINITY_MASK")
+        selector_value = environ.get("ONEAPI_DEVICE_SELECTOR")
+        mask = parse_xpu_ids(mask_value, "ZE_AFFINITY_MASK") if mask_value is not None else None
+        selected = _oneapi_selector_ids(selector_value) if selector_value is not None else None
+        # Unlike CUDA_VISIBLE_DEVICES, neither variable reorders devices: Level Zero and SYCL
+        # keep driver enumeration order, so xpu:k is the k-th lowest visible index.
+        mask = sorted(mask, key=int) if mask is not None else None
+        selected = sorted(selected, key=int) if selected is not None else None
+        if selected is None:
+            return ("ZE_AFFINITY_MASK", mask) if mask is not None else (None, None)
+        if mask is None:
+            return "ONEAPI_DEVICE_SELECTOR", selected
+        # ONEAPI_DEVICE_SELECTOR indexes the devices left visible by ZE_AFFINITY_MASK.
+        try:
+            return "ZE_AFFINITY_MASK+ONEAPI_DEVICE_SELECTOR", [mask[int(i)] for i in selected]
+        except IndexError:
+            raise ValueError(f"ONEAPI_DEVICE_SELECTOR {selector_value!r} selects devices outside "
+                             f"ZE_AFFINITY_MASK {mask_value!r}") from None
+    return None, None
+
+
+def current_index(backend):
+    if backend == CUDA and torch.cuda.is_available():
+        return torch.cuda.current_device()
+    if backend == XPU and xpu_is_available():
+        return torch.xpu.current_device()
+    return None
+
+
+def device_count(backend):
+    if backend == CUDA:
+        return torch.cuda.device_count()
+    if backend == XPU:
+        return torch.xpu.device_count() if xpu_is_available() else 0
+    return 0
+
+
+def required_visible_count(backend, world, environ=None):
+    """Devices rank 0 itself must see; isolated XPU workers get their own Level Zero mask."""
+    if backend == CPU:
+        return 0
+    if backend == XPU and xpu_visibility_mode(environ) == "isolated":
+        return 1
+    return world
+
+
+def rank0_device(backend):
+    index = current_index(backend)
+    if backend == CPU:
+        return torch.device("cpu")
+    return torch.device(backend.name, 0 if index is None else index)
+
+
+def worker_env(backend, base_env, device_id):
+    """(environment, local device index) for a worker bound to physical device_id."""
+    env = dict(base_env)
+    if backend == CUDA:
+        env["CUDA_VISIBLE_DEVICES"] = device_id
+        env["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+        env["TORCH_NCCL_BLOCKING_WAIT"] = "1"
+        return env, 0
+    if backend == XPU:
+        if xpu_visibility_mode(base_env) == "shared":
+            _, visible = visible_devices(XPU, base_env)
+            return env, visible.index(device_id) if visible is not None else int(device_id)
+        # ZE_AFFINITY_MASK uses driver-level indices, so the worker sees exactly this card
+        # as xpu:0. Drop the inherited selector: it would index the masked list.
+        env["ZE_AFFINITY_MASK"] = device_id
+        env.pop("ONEAPI_DEVICE_SELECTOR", None)
+        return env, 0
+    return env, 0
+
+
+def joined_key(rank):
+    """TCPStore key a worker sets once it reaches the rendezvous."""
+    return f"minimax_sp/joined/{rank}"
+
+
+def apply_process_env(backend, environ=None):
+    environ = os.environ if environ is None else environ
+    if backend == CUDA:
+        environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+        environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
+
+
+def set_device(backend, index):
+    if backend == CUDA:
+        torch.cuda.set_device(index)
+    elif backend == XPU:
+        torch.xpu.set_device(index)
+
+
+def memory_allocated(device):
+    device = torch.device(device)
+    if device.type == "cuda":
+        return torch.cuda.memory_allocated(device)
+    if device.type == "xpu":
+        return torch.xpu.memory_allocated(device)
+    return 0
+
+
+def synchronize(device=None):
+    """Wait for the accelerator (the given device, or the current CUDA/XPU device)."""
+    if device is not None:
+        kind = torch.device(device).type
+    elif torch.cuda.is_available():
+        kind = "cuda"
+    else:
+        kind = "xpu" if xpu_is_available() else "cpu"
+    if kind == "cuda":
+        torch.cuda.synchronize(device)
+    elif kind == "xpu":
+        torch.xpu.synchronize(device)
+
+
+def init_groups(backend, store, rank, world, control_timeout, tensor_timeout):
+    """Create this process's (control_pg, tensor_pg): Gloo for pickled control messages and
+    the backend's collective library for tensors. One of them is the default group."""
+    if backend.tensor_group_is_default:
+        dist.init_process_group(backend.dist_backend, store=store, rank=rank, world_size=world,
+                                timeout=tensor_timeout)
+    else:
+        dist.init_process_group("gloo", store=store, rank=rank, world_size=world, timeout=control_timeout)
+    try:
+        if backend.tensor_group_is_default:
+            return dist.new_group(backend="gloo", timeout=control_timeout), dist.group.WORLD
+        return dist.group.WORLD, dist.new_group(backend=backend.dist_backend, timeout=tensor_timeout)
+    except BaseException:
+        dist.destroy_process_group()
+        raise
+
+
+def destroy_groups(backend, control_pg, tensor_pg, owns_default):
+    """Destroy the subgroup, then the default group if this process created it."""
+    if backend is not None and backend.tensor_group_is_default:
+        subgroup, default = control_pg, tensor_pg
+    else:
+        subgroup, default = tensor_pg, control_pg
+    try:
+        if subgroup is not None:
+            dist.destroy_process_group(subgroup)
+    finally:
+        if owns_default and default is not None:
+            dist.destroy_process_group(default)
+
+
+def bounded_timeout(backend, timeout):
+    return timeout if backend is not None and backend.bounded_waits else None
+
+
+def run_collective(op, *args, timeout=None, **kwargs):
+    """Issue a tensor collective; with a timeout, block until it finishes or raise.
+
+    XCCL runs a process group's collectives in order on one stream, so a bounded wait
+    on the last collective of a forward also catches a hang in any earlier one while
+    the hot-path all-to-alls stay asynchronous.
+    """
+    if timeout is None:
+        return op(*args, **kwargs)
+    work = op(*args, async_op=True, **kwargs)
+    work.wait(timeout)
+    return None
+
+
+def all_gather_single_op():
+    # all_gather_single is new in PyTorch 2.13; older XPU stacks only ship the legacy name.
+    return getattr(dist, "all_gather_single", None) or dist.all_gather_into_tensor

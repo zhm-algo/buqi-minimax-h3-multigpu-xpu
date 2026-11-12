@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Add Intel Arc Pro B70 / Intel XPU support through PyTorch XPU and the XCCL backend (Linux only). The backend is selected automatically (CUDA first, then XPU) or with `MINIMAX_SP_BACKEND`; the NVIDIA/NCCL path is unchanged.
+- Map XPU devices through `ZE_AFFINITY_MASK` and simple `ONEAPI_DEVICE_SELECTOR=level_zero:<ids>` values, following driver enumeration order (the mask order does not reorder devices, unlike `CUDA_VISIBLE_DEVICES`). Workers keep ComfyUI's visibility by default (`MINIMAX_SP_XPU_VISIBILITY=shared`); `isolated` gives each worker its own mask, but oneCCL's all-to-all hangs on B70 when the ranks' masks differ.
+- On XPU, make the XCCL tensor group the default process group and the Gloo control plane a subgroup: an XCCL subgroup under a Gloo default group hangs in its first collective on B70. The CUDA layout is unchanged.
+- Because XCCL has no NCCL-style watchdog, XPU waits on the startup probe and on the final gather of each forward with an explicit `MINIMAX_SP_COLLECTIVE_TIMEOUT` bound.
+- Add XPU backend unit tests, a CPU/Gloo end-to-end SPGroup lifecycle test, a bounded-wait case in the two-rank parity check, `latent_parity.py --backend`, and an opt-in self-hosted XPU acceptance job.
+- Add `tests/sp_diagnose.py`, which attributes a parity failure to communication, SP logic, or device kernel rounding, and report `rel_l2` and cosine similarity in `latent_parity.py`.
+- Support XPU DynamicVRAM through ComfyUI-OmniXPU: workers follow rank 0's DynamicVRAM state, run OmniXPU's prestartup before importing PyTorch, and load its adapters after AIMDO device init, failing startup if their active runtime providers differ from rank 0 and logging adapter differences (e.g. preprocessing adapters for nodes that only run on rank 0) as worker warnings. Active XPU DynamicVRAM without the OmniXPU `comfy_aimdo.xpu` provider, or an inherited `native_hook` allocator without active DynamicVRAM, is rejected before workers start. Report workers that exit before the rendezvous immediately, include worker log paths in startup errors, and retain worker exception tracebacks before disconnecting.
+- Validate XPU T2V end to end on two PCIe-connected Arc Pro B70 cards with ComfyUI 0.39.0, PyTorch 2.14.0+xpu and OmniXPU DynamicVRAM: 1.4× to 1.8× faster sampling than one card, with the gain growing with resolution and length. Other workflows are covered only by CPU/mocked tests.
+
 ## 0.1.0
 
 - Add a ComfyUI-discoverable package entrypoint and Comfy Registry metadata.

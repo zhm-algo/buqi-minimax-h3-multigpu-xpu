@@ -134,6 +134,67 @@ class SPFailFastTests(unittest.TestCase):
                 spg.SPGroup(2, "model", "default", ["0", "1"])
         destroy.assert_called_once()
 
+    def test_startup_error_includes_worker_logs_and_preserves_cause(self):
+        failure = RuntimeError("Connection closed by peer")
+
+        def start(group, *args):
+            group.log_paths = {1: "worker1.log", 2: "worker2.log"}
+            raise failure
+
+        with patch.object(spg.dist, "is_initialized", return_value=False), \
+                patch.object(spg.SPGroup, "_start", start), \
+                patch.object(spg.SPGroup, "destroy") as destroy:
+            with self.assertRaisesRegex(
+                    RuntimeError, "Connection closed by peer.*Worker logs: rank 1: worker1.log; rank 2: worker2.log"
+            ) as caught:
+                spg.SPGroup(3, "model", "default", ["0", "1", "2"])
+        self.assertIs(caught.exception.__cause__, failure)
+        destroy.assert_called_once()
+
+    def test_startup_cancellation_is_not_wrapped_as_worker_failure(self):
+        interrupt = spg.comfy.model_management.InterruptProcessingException()
+
+        def start(group, *args):
+            group.log_paths = {1: "worker1.log"}
+            raise interrupt
+
+        with patch.object(spg.dist, "is_initialized", return_value=False), \
+                patch.object(spg.SPGroup, "_start", start), \
+                patch.object(spg.SPGroup, "destroy") as destroy:
+            with self.assertRaises(type(interrupt)) as caught:
+                spg.SPGroup(2, "model", "default", ["0", "1"])
+        self.assertIs(caught.exception, interrupt)
+        destroy.assert_called_once()
+
+    def join_wait_group(self, poll, timeout):
+        group = object.__new__(spg.SPGroup)
+        group.world = 2
+        group.store = Mock()
+        group.store.check.return_value = False
+        group.procs = [Mock(returncode=poll)]
+        group.procs[0].poll.return_value = poll
+        group.startup_timeout = timeout
+        return group
+
+    def test_worker_exit_before_join_is_reported_without_waiting_for_timeout(self):
+        group = self.join_wait_group(3, timedelta(seconds=300))
+        with patch.object(spg.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "rank 1 exited with code 3 before joining"):
+                group._wait_for_workers_to_join()
+        sleep.assert_not_called()
+        group.store.check.assert_called_with([spg.spdev.joined_key(1)])
+
+    def test_join_wait_is_bounded_by_startup_timeout(self):
+        group = self.join_wait_group(None, timedelta(seconds=0))
+        with self.assertRaisesRegex(TimeoutError, "did not join"):
+            group._wait_for_workers_to_join()
+
+    def test_joined_workers_do_not_wait(self):
+        group = self.join_wait_group(None, timedelta(seconds=300))
+        group.store.check.return_value = True
+        group._wait_for_workers_to_join()
+        group.procs[0].poll.assert_not_called()
+
     def test_metadata_mismatch_stops_before_rank0_tensor_collective(self):
         tensor_pg, control_pg = object(), object()
         meta = forward_meta()

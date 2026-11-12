@@ -39,6 +39,8 @@ from comfy.ldm.minimax.model import (
 )
 from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
 
+from . import device as spdev
+
 PROFILE_OPS = bool(os.environ.get("MINIMAX_SP_PROFILE_OPS"))
 _prof_acc = {}
 
@@ -51,13 +53,13 @@ class region:
 
     def __enter__(self):
         if PROFILE_OPS:
-            torch.cuda.synchronize()
+            spdev.synchronize()
             self.t0 = time.perf_counter()
         return self
 
     def __exit__(self, *exc):
         if PROFILE_OPS:
-            torch.cuda.synchronize()
+            spdev.synchronize()
             _prof_acc[self.name] = _prof_acc.get(self.name, 0.0) + time.perf_counter() - self.t0
         return False
 
@@ -82,11 +84,13 @@ def validate_transformer_options(transformer_options):
 class SPContext:
     """Row-sharding descriptor for one forward pass."""
 
-    def __init__(self, rank, world, group, seq_len):
+    def __init__(self, rank, world, group, seq_len, timeout=None):
         self.rank = rank
         self.world = world
         self.group = group
         self.seq_len = seq_len
+        # Bounded wait for the forward's last collective (XPU only, see device.run_collective).
+        self.timeout = timeout
         base, rem = divmod(seq_len, world)
         self.splits = [base + (1 if r < rem else 0) for r in range(world)]
         self.start = sum(self.splits[:rank])
@@ -204,13 +208,14 @@ def _gather_rows(local, counts, ctx, out_dim, device):
     if local is not None:
         buf[:local.shape[0]] = local
     gathered = torch.empty(ctx.world * maxn, out_dim, dtype=torch.float32, device=buf.device)
-    dist.all_gather_single(gathered, buf, group=ctx.group)
+    spdev.run_collective(spdev.all_gather_single_op(), gathered, buf, group=ctx.group,
+                         timeout=getattr(ctx, "timeout", None))
     gathered = gathered.view(ctx.world, maxn, out_dim)
     return torch.cat([gathered[r, :counts[r]] for r in range(ctx.world) if counts[r] > 0], dim=0)
 
 
 def sp_forward(dit, x, timestep, context, transformer_options, minimax_payload, rank, world, group,
-               denoise_mask=None, audio_denoise_mask=None):
+               denoise_mask=None, audio_denoise_mask=None, collective_timeout=None):
     """Sequence-parallel mirror of MiniMaxH3Model._forward.
 
     Returns [video_velocity, audio_velocity] on rank 0, None elsewhere.
@@ -325,7 +330,7 @@ def sp_forward(dit, x, timestep, context, transformer_options, minimax_payload, 
         text_states = dit.token_refiner(dit.condition_proj(text_states),
                                         transformer_options=transformer_options)
 
-    ctx = SPContext(rank, world, group, layout.seq_len)
+    ctx = SPContext(rank, world, group, layout.seq_len, collective_timeout)
     # embedding assembly is row-local and cheap; every rank builds only its own window
     h = torch.empty(ctx.local, dit.hidden_size, dtype=dtype, device=device)
     voff = aoff = 0
@@ -359,7 +364,7 @@ def sp_forward(dit, x, timestep, context, transformer_options, minimax_payload, 
     rope_for_blocks = rope_freqs[:, ctx.start:ctx.stop].contiguous()
 
     if PROFILE_OPS:
-        torch.cuda.synchronize()
+        spdev.synchronize()
         _prof_acc["pre"] = time.perf_counter() - t_fwd
 
     prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(dit.blocks), device, transformer_options)

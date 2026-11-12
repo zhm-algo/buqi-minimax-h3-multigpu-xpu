@@ -67,6 +67,14 @@ def main():
             for label, actual, expected in zip(("video", "audio"), got, ref):
                 torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
                 print(name, label, "PASS", "max_abs", float((actual-expected).abs().max()), flush=True)
+    # Intel XPU bounds the final gather with an explicit wait; run that path over Gloo too.
+    ref = model._forward(x, t, context, transformer_options={})
+    got = spf.sp_forward(model, x, t, context, {}, None, rank, world, None,
+                         collective_timeout=timedelta(seconds=60))
+    if rank == 0:
+        for label, actual, expected in zip(("video", "audio"), got, ref):
+            torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+            print("bounded_wait", label, "PASS", flush=True)
     dist.destroy_process_group()
 
 

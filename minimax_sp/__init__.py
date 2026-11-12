@@ -5,8 +5,10 @@ processes (one per extra GPU) and routes every diffusion-model forward through
 a sequence-parallel path. Mathematically equivalent to single-GPU sampling:
 same latents, same video/audio output.
 
-Launch ComfyUI with all target GPUs visible, e.g. for 2 GPUs:
+Launch ComfyUI with all target GPUs visible, e.g. for 2 NVIDIA GPUs:
     python main.py --cuda-device 0,1 --highvram
+or for 2 Intel XPUs (e.g. Arc Pro B70), on Linux (DynamicVRAM via ComfyUI-OmniXPU is optional):
+    ZE_AFFINITY_MASK=0,1 python main.py
 """
 
 import inspect
@@ -21,6 +23,7 @@ import comfy.ops
 import comfy.sd
 import folder_paths
 
+from . import device as spdev
 from . import sp_group
 from .sp_forward import validate_transformer_options
 
@@ -57,46 +60,45 @@ def check_h3_api():
                  comfyui_version.__version__, inspect.signature(MiniMaxH3Model))
 
 
-def _parse_device_list(value, source):
-    picked = [item.strip() for item in value.split(",")]
-    if not picked or any(not item for item in picked):
-        raise ValueError(f"{source} must be a comma-separated list of CUDA device identifiers")
-    if len(set(picked)) != len(picked):
-        raise ValueError(f"{source} contains duplicate CUDA devices: {value}")
-    return picked
+def resolve_devices(devices, world, backend=spdev.CUDA):
+    """Physical device ids for ranks 0..world-1.
 
-
-def resolve_devices(devices, world):
-    visible_value = os.environ.get("CUDA_VISIBLE_DEVICES")
-    visible = None
-    if visible_value is not None:
-        visible = _parse_device_list(visible_value, "CUDA_VISIBLE_DEVICES")
-        if visible == ["-1"]:
-            raise ValueError("CUDA_VISIBLE_DEVICES exposes no CUDA devices")
+    CUDA ids come from CUDA_VISIBLE_DEVICES. XPU ids are Level Zero indices as used by
+    ZE_AFFINITY_MASK (composed with a simple ONEAPI_DEVICE_SELECTOR). Workers in the
+    non-default isolated XPU mode get their own mask, so only rank 0's id must be visible.
+    """
+    if backend == spdev.CPU:
+        return [str(i) for i in range(world)]
+    kind = "XPU" if backend == spdev.XPU else "CUDA"
+    parse = spdev.parse_xpu_ids if backend == spdev.XPU else spdev.parse_device_list
+    visible_source, visible = spdev.visible_devices(backend)
 
     explicit = devices and devices.strip() and devices.strip().lower() != "auto"
     override = os.environ.get("MINIMAX_SP_DEVICES") if not explicit else None
     if explicit or override:
         source = "devices" if explicit else "MINIMAX_SP_DEVICES"
         value = devices if explicit else override
-        picked = _parse_device_list(value, source)
+        picked = parse(value, source)
         if len(picked) != world:
             raise ValueError(f'{source} "{value}" lists {len(picked)} GPUs, world_size is {world}')
     elif visible is not None:
         if len(visible) < world:
-            raise ValueError(f"CUDA_VISIBLE_DEVICES lists {len(visible)} devices, need {world}")
+            raise ValueError(f"{visible_source} lists {len(visible)} devices, need {world}")
         picked = visible[:world]
     else:
         picked = [str(i) for i in range(world)]
 
     if visible is not None:
-        missing = [device for device in picked if device not in visible]
+        isolated = backend == spdev.XPU and spdev.xpu_visibility_mode() == "isolated"
+        missing = [device for device in (picked[:1] if isolated else picked) if device not in visible]
         if missing:
-            raise ValueError(f"SP worker devices must be physical identifiers from CUDA_VISIBLE_DEVICES; missing {missing}")
+            raise ValueError(f"SP worker devices must be physical identifiers from {visible_source}; missing {missing}")
         if picked[0] != visible[0]:
             raise ValueError(f"first SP device {picked[0]} must match ComfyUI's primary visible device {visible[0]}")
-    elif torch.cuda.is_available() and picked[0] != str(torch.cuda.current_device()):
-        raise ValueError(f"first SP device {picked[0]} must match ComfyUI's current CUDA device {torch.cuda.current_device()}")
+    else:
+        current = spdev.current_index(backend)
+        if current is not None and picked[0] != str(current):
+            raise ValueError(f"first SP device {picked[0]} must match ComfyUI's current {kind} device {current}")
     return picked
 
 
@@ -117,9 +119,10 @@ class MiniMaxH3SPUNETLoader(io.ComfyNode):
                              tooltip="GPUs to shard across. Must divide the 56 attention heads "
                                      "(valid: 1, 2, 4, 7, 8)."),
                 io.String.Input("devices", default="auto",
-                                tooltip='Comma-separated physical CUDA ids, e.g. "2,3". The first id '
-                                        'must be ComfyUI\'s primary visible GPU. "auto" uses '
-                                        'MINIMAX_SP_DEVICES, then CUDA_VISIBLE_DEVICES.'),
+                                tooltip='Comma-separated physical device ids, e.g. "2,3" (CUDA ids, or '
+                                        'Level Zero indices on Intel XPU). The first id must be '
+                                        'ComfyUI\'s primary visible GPU. "auto" uses MINIMAX_SP_DEVICES, '
+                                        'then CUDA_VISIBLE_DEVICES / ZE_AFFINITY_MASK.'),
             ],
             outputs=[io.Model.Output()],
         )
@@ -142,9 +145,11 @@ class MiniMaxH3SPUNETLoader(io.ComfyNode):
         if world_size <= 1:
             return io.NodeOutput(model)
 
-        if sys.platform == "win32":
-            raise RuntimeError("multi-GPU SP needs NCCL, which is not available on native Windows; "
-                               "run ComfyUI inside WSL2 or on Linux")
+        backend = spdev.select_backend()
+        problem = spdev.platform_error(backend, sys.platform)
+        if problem:
+            raise RuntimeError(problem)
+        spdev.check_available(backend)
 
         dit = model.get_model_object("diffusion_model")
         if not isinstance(dit, MiniMaxH3Model):
@@ -154,12 +159,18 @@ class MiniMaxH3SPUNETLoader(io.ComfyNode):
             raise ValueError(f"world_size {world_size} must divide the {heads} attention heads "
                              "(valid: 1, 2, 4, 7, 8)")
 
-        picked = resolve_devices(devices, world_size)
-        if torch.cuda.device_count() < world_size:
-            raise ValueError(f"world_size is {world_size} but only {torch.cuda.device_count()} GPUs "
+        picked = resolve_devices(devices, world_size, backend)
+        required = spdev.required_visible_count(backend, world_size)
+        available = spdev.device_count(backend)
+        if available < required:
+            if backend == spdev.XPU:
+                raise ValueError(f"world_size is {world_size} but only {available} Intel XPUs are visible; "
+                                 "start ComfyUI with e.g. ZE_AFFINITY_MASK=0,1 "
+                                 "or --oneapi-device-selector level_zero:0,1")
+            raise ValueError(f"world_size is {world_size} but only {available} GPUs "
                              "are visible; start ComfyUI with e.g. --cuda-device 0,1")
 
-        sp_group.get_group(world_size, unet_name, weight_dtype, picked)
+        sp_group.get_group(world_size, unet_name, weight_dtype, picked, backend)
 
         model = model.clone()
         dit = model.get_model_object("diffusion_model")
@@ -168,18 +179,19 @@ class MiniMaxH3SPUNETLoader(io.ComfyNode):
                      denoise_mask=None, audio_denoise_mask=None, **kwargs):
             transformer_options = transformer_options or {}
             validate_transformer_options(transformer_options)
-            group = sp_group.get_group(world_size, unet_name, weight_dtype, picked)
+            group = sp_group.get_group(world_size, unet_name, weight_dtype, picked, backend)
             return group.forward(dit, x, timestep, context, transformer_options, minimax_payload,
                                  denoise_mask, audio_denoise_mask)
 
         def sync_patches(patcher):
-            group = sp_group.get_group(world_size, unet_name, weight_dtype, picked)
+            group = sp_group.get_group(world_size, unet_name, weight_dtype, picked, backend)
             group.sync_patches(patcher)
 
         model.add_callback_with_key(CallbacksMP.ON_PRE_RUN, "minimax_sp_lora", sync_patches)
         # ModelPatcher installs/restores the inner call without bypassing outer wrappers.
         model.add_object_patch("diffusion_model._forward", sp_entry)
-        logging.info(f"[minimax_sp] sequence parallel enabled, world_size={world_size} devices={picked}")
+        logging.info(f"[minimax_sp] sequence parallel enabled, world_size={world_size} "
+                     f"backend={backend.label} devices={picked}")
         return io.NodeOutput(model)
 
 
