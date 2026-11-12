@@ -10,10 +10,12 @@ Row splits are deliberately uneven (base + remainder) instead of padding the
 sequence, so no attention mask is needed and results stay numerically equivalent
 to the single-GPU path.
 
-Targets the MiniMax H3 API introduced by ComfyUI commit 8d534945.
+Targets the MiniMax H3 API introduced by ComfyUI commit 8d534945, including the
+ComfyUI 0.45 FinalLayer that takes per-stream PDD sigma grids instead of flow shifts.
 sp_forward mirrors MiniMaxH3Model._forward and must be re-checked when it changes.
 """
 
+import inspect
 import logging
 import os
 import time
@@ -25,6 +27,7 @@ import comfy.ldm.common_dit
 import comfy.model_management
 import comfy.model_prefetch
 import comfy.quant_ops
+import comfy.ldm.minimax.model as h3_model
 from comfy.ldm.minimax.model import (
     AUDIO_COND_TIMESTEP,
     VISUAL_COND_TIMESTEP,
@@ -89,7 +92,7 @@ class SPContext:
         self.world = world
         self.group = group
         self.seq_len = seq_len
-        # Bounded wait for the forward's last collective (XPU only, see device.run_collective).
+        # Bound XPU work and temporary-buffer lifetime at each collective.
         self.timeout = timeout
         base, rem = divmod(seq_len, world)
         self.splits = [base + (1 if r < rem else 0) for r in range(world)]
@@ -109,11 +112,12 @@ def a2a_gather_seq_scatter_heads(t, ctx):
     chunk = hp * dim
     send = t.reshape(s_local, p, chunk).transpose(0, 1).contiguous().view(-1)
     out = torch.empty(ctx.seq_len * chunk, dtype=t.dtype, device=t.device)
-    dist.all_to_all_single(
+    spdev.run_collective(dist.all_to_all_single,
         out, send,
         output_split_sizes=[n * chunk for n in ctx.splits],
         input_split_sizes=[s_local * chunk] * p,
         group=ctx.group,
+        timeout=ctx.timeout,
     )
     return out.view(ctx.seq_len, hp, dim)
 
@@ -124,11 +128,12 @@ def a2a_scatter_seq_gather_heads(t, ctx):
     p = ctx.world
     s_local = ctx.local
     out = torch.empty(p * s_local * chunk, dtype=t.dtype, device=t.device)
-    dist.all_to_all_single(
+    spdev.run_collective(dist.all_to_all_single,
         out, t.contiguous().view(-1),
         output_split_sizes=[s_local * chunk] * p,
         input_split_sizes=[n * chunk for n in ctx.splits],
         group=ctx.group,
+        timeout=ctx.timeout,
     )
     return out.view(p, s_local, chunk).transpose(0, 1).reshape(s_local, p * chunk)
 
@@ -176,6 +181,8 @@ def sp_attention(attn, x, rope_freqs, ctx, transformer_options):
         out = run_optimized_attention(
             attn, q.transpose(0, 1).unsqueeze(0), k.transpose(0, 1).unsqueeze(0),
             v.transpose(0, 1).unsqueeze(0), hp, transformer_options)
+    # Full-sequence Q/K/V are no longer needed during the output exchange/projection.
+    del q, k, v
     with region("a2a_out"):
         out = a2a_scatter_seq_gather_heads(out.squeeze(0), ctx)
     with region("out_proj"):
@@ -199,6 +206,24 @@ def shard_segments(segments, start, stop):
         if hi > lo:
             out.append((lo - start, hi - start, row[lo-a:hi-a] if torch.is_tensor(row) else row))
     return out
+
+
+def final_layer_schedule(final_layer, shift_v, shift_a):
+    """Last FinalLayer.forward argument for the running ComfyUI.
+
+    ComfyUI <= 0.44 takes the (video, audio) flow shifts; 0.45 takes one decreasing
+    PDD sigma grid per stream, built by model.pdd_grid, exactly like MiniMaxH3Model._forward.
+    """
+    if "grids" in inspect.signature(type(final_layer).forward).parameters:
+        n = final_layer.pdd_steps
+        return (h3_model.pdd_grid(n, shift_v), h3_model.pdd_grid(n, shift_a))
+    return (shift_v, shift_a)
+
+
+def final_output_dims(dit):
+    """Per-row widths of the video and audio velocities (independent of stacked PDD heads)."""
+    pt, ph, pw = dit.patch_size
+    return dit.latents_dim * pt * ph * pw, dit.audio_latents_dim
 
 
 def _gather_rows(local, counts, ctx, out_dim, device):
@@ -393,10 +418,12 @@ def sp_forward(dit, x, timestep, context, transformer_options, minimax_payload, 
             return (lo-ctx.start, hi-ctx.start, row[lo-a:hi-a] if torch.is_tensor(row) else row)
 
         v_local, a_local = dit.final_layer(h, t_emb, local_seg(video_seg), local_seg(audio_seg),
-                                          sigma_v, transformer_options.get("sample_sigmas"), (shift_v, shift_a))
+                                          sigma_v, transformer_options.get("sample_sigmas"),
+                                          final_layer_schedule(dit.final_layer, shift_v, shift_a))
 
-        v = _gather_rows(v_local, counts_for(video_seg), ctx, dit.final_layer.video_out.out_features, device)
-        a = _gather_rows(a_local, counts_for(audio_seg), ctx, dit.final_layer.audio_out.out_features, device)
+        video_dim, audio_dim = final_output_dims(dit)
+        v = _gather_rows(v_local, counts_for(video_seg), ctx, video_dim, device)
+        a = _gather_rows(a_local, counts_for(audio_seg), ctx, audio_dim, device)
     if PROFILE_OPS and rank == 0:
         prof_report(time.perf_counter() - t_fwd)
     if rank != 0:

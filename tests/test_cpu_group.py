@@ -71,6 +71,14 @@ class CPUGroupLifecycleTests(unittest.TestCase):
                             got = group.forward(dit, x, timestep, context, {}, None)
                             for actual, reference in zip(got, expected):
                                 torch.testing.assert_close(actual, reference, atol=1e-5, rtol=1e-4)
+                        model.cleanup()
+                        self.assertFalse(group.patches_ready)
+                        group.check_alive()
+                        model.pre_run()
+                        got = group.forward(dit, x, timestep, context, {}, None)
+                        for actual, reference in zip(got, expected):
+                            torch.testing.assert_close(actual, reference, atol=1e-5, rtol=1e-4)
+                        model.cleanup()
                     procs = list(group.procs)
                     group.shutdown()
                     self.assertIsNone(sp_group.active_group())

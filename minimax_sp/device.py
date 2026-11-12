@@ -8,7 +8,10 @@ on machines without accelerators.
 This module only depends on torch so the worker can load it before ComfyUI.
 """
 
+import logging
 import os
+import threading
+import time
 from typing import NamedTuple
 
 import torch
@@ -23,8 +26,7 @@ class Backend(NamedTuple):
     dist_backend: str
     label: str
     visible_env: str | None
-    # XCCL has no watchdog and plain waits never time out, so XPU collectives are
-    # bounded explicitly at checkpoints (see run_collective).
+    # XCCL has no watchdog, so tensor collectives need explicit bounded waits.
     bounded_waits: bool
     # On Arc Pro B70 (PyTorch 2.14 XCCL) a communicator created with new_group under a
     # Gloo default group hangs in its first collective, so XPU makes the tensor group the
@@ -243,6 +245,15 @@ def memory_allocated(device):
     return 0
 
 
+def memory_reserved(device):
+    device = torch.device(device)
+    if device.type == "cuda":
+        return torch.cuda.memory_reserved(device)
+    if device.type == "xpu":
+        return torch.xpu.memory_reserved(device)
+    return 0
+
+
 def synchronize(device=None):
     """Wait for the accelerator (the given device, or the current CUDA/XPU device)."""
     if device is not None:
@@ -292,18 +303,83 @@ def bounded_timeout(backend, timeout):
     return timeout if backend is not None and backend.bounded_waits else None
 
 
-def run_collective(op, *args, timeout=None, **kwargs):
-    """Issue a tensor collective; with a timeout, block until it finishes or raise.
+_COLLECTIVE_MONITOR = threading.local()
 
-    XCCL runs a process group's collectives in order on one stream, so a bounded wait
-    on the last collective of a forward also catches a hang in any earlier one while
-    the hot-path all-to-alls stay asynchronous.
-    """
-    if timeout is None:
-        return op(*args, **kwargs)
-    work = op(*args, async_op=True, **kwargs)
-    work.wait(timeout)
-    return None
+
+class CollectiveMonitor:
+    """Log failed workers and host-side XCCL stalls without touching a wedged device."""
+
+    _poll_interval = 1.0
+
+    def __init__(self, processes, log_paths, timeout):
+        self.processes = processes
+        self.log_paths = log_paths
+        self.timeout = timeout.total_seconds()
+        self.active = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="minimax_sp_monitor", daemon=True)
+
+    def __enter__(self):
+        self._previous = getattr(_COLLECTIVE_MONITOR, "current", None)
+        _COLLECTIVE_MONITOR.current = self
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop()
+        _COLLECTIVE_MONITOR.current = self._previous
+        return False
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join()
+
+    def _check(self):
+        for rank, process in enumerate(self.processes, start=1):
+            code = process.poll()
+            if code is not None:
+                logging.critical(
+                    "[minimax_sp] worker rank %s exited with code %s; see %s. "
+                    "XCCL may still be blocked in the main process. Restart ComfyUI or the container; "
+                    "ComfyUI will NOT be terminated automatically.",
+                    rank, code, self.log_paths[rank])
+                return True
+        active = self.active
+        if active is not None and time.monotonic() - active[1] >= self.timeout:
+            logging.critical(
+                "[minimax_sp] XCCL %s exceeded %.1fs, including host-side enqueue time. "
+                "Check worker logs: %s. A blocked XCCL call cannot be cancelled safely; "
+                "restart ComfyUI or the container. ComfyUI will NOT be terminated automatically.",
+                active[0], self.timeout, self.log_paths)
+            return True
+        return False
+
+    def _run(self):
+        while not self._stop.wait(self._poll_interval):
+            if self._check():
+                return
+
+
+def stop_collective_monitor():
+    monitor = getattr(_COLLECTIVE_MONITOR, "current", None)
+    if monitor is not None:
+        monitor.stop()
+
+
+def run_collective(op, *args, timeout=None, **kwargs):
+    """Issue a tensor collective; XPU waits bound both GPU work and buffer lifetime."""
+    monitor = getattr(_COLLECTIVE_MONITOR, "current", None)
+    if monitor is not None:
+        monitor.active = (getattr(op, "__name__", type(op).__name__), time.monotonic())
+    try:
+        if timeout is None:
+            return op(*args, **kwargs)
+        work = op(*args, async_op=True, **kwargs)
+        work.wait(timeout)
+        return None
+    finally:
+        if monitor is not None:
+            monitor.active = None
 
 
 def all_gather_single_op():

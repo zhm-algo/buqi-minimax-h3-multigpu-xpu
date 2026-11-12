@@ -1,9 +1,8 @@
 """Worker process for the MiniMax-H3 sequence-parallel group (rank >= 1).
 
-Launched with its own device mask (CUDA_VISIBLE_DEVICES=<id> on CUDA,
-ZE_AFFINITY_MASK=<id> on Intel XPU), so its single visible GPU is device 0 and
-ComfyUI's model management needs no per-device plumbing. Holds only the DiT: no
-text encoder, no VAE. Parks on a gloo broadcast waiting for work.
+CUDA workers use their own device mask; XPU workers normally share visibility
+and bind the assigned logical device. Holds only the DiT: no text encoder, no
+VAE. Parks on a gloo broadcast waiting for work.
 """
 
 import argparse
@@ -201,17 +200,20 @@ def main(a, omnixpu_state=None):
                 logging.info(f"rank {a.rank}: shutdown after {steps} forwards")
                 break
 
-            if meta.get("op") in ("prepare", "patches"):
+            if meta.get("op") in ("prepare", "patches", "cleanup"):
                 try:
                     if meta["op"] == "prepare":
                         reply = patches.prepare(meta["memory_required"], meta["version"])
+                    elif meta["op"] == "cleanup":
+                        reply = patches.cleanup()
+                        logging.info("rank %s: sampler cleanup complete", a.rank)
                     else:
                         manifest = PatchManifest.from_message(meta)
                         reply = patches.apply(manifest)
                         logging.info("rank %s: applied %d patched keys, sha256=%s",
                                      a.rank, len(manifest.keys), manifest.sha256)
                 except Exception as exc:
-                    logging.error("worker patch preparation failed: %s", exc)
+                    logging.exception("worker %s failed", meta["op"])
                     reply = {"rank": a.rank, "error": str(exc)}
                 dist.all_gather_object([None] * a.world, reply, group=control_pg)
                 continue

@@ -44,6 +44,46 @@ class APICompatibilityTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "FinalLayer.forward is missing"):
                 node.check_h3_api()
 
+    def test_shift_and_grid_final_layers_accepted(self):
+        def shifts(self, x, t_emb, video_seg, audio_seg, sigma, sample_sigmas, shifts):
+            return x
+
+        def grids(self, x, t_emb, video_seg, audio_seg, sigma, sample_sigmas, grids):
+            return x
+
+        with patch.object(node, "FinalLayer", SimpleNamespace(forward=shifts)):
+            node.check_h3_api()
+        with patch.object(node, "FinalLayer", SimpleNamespace(forward=grids, pdd_steps=1)), \
+                patch.object(node.h3_model, "pdd_grid", lambda n, shift: [1.0, 0.0], create=True):
+            node.check_h3_api()
+
+    def test_grid_final_layer_requires_pdd_grid(self):
+        def grids(self, x, t_emb, video_seg, audio_seg, sigma, sample_sigmas, grids):
+            return x
+
+        with patch.object(node, "FinalLayer", SimpleNamespace(forward=grids)):
+            with self.assertRaisesRegex(RuntimeError, "pdd_grid"):
+                node.check_h3_api()
+
+    def test_final_layer_schedule_matches_running_api(self):
+        class ShiftFinal:
+            def forward(self, x, t_emb, video_seg, audio_seg, sigma, sample_sigmas, shifts):
+                return x
+
+        class GridFinal:
+            pdd_steps = 2
+
+            def forward(self, x, t_emb, video_seg, audio_seg, sigma, sample_sigmas, grids):
+                return x
+
+        self.assertEqual(spf.final_layer_schedule(ShiftFinal(), 12.0, 3.0), (12.0, 3.0))
+        with patch.object(spf.h3_model, "pdd_grid", lambda n, shift: (n, shift), create=True):
+            self.assertEqual(spf.final_layer_schedule(GridFinal(), 12.0, 3.0), ((2, 12.0), (2, 3.0)))
+
+    def test_final_output_dims_ignore_stacked_pdd_heads(self):
+        dit = SimpleNamespace(patch_size=(1, 2, 2), latents_dim=24, audio_latents_dim=32)
+        self.assertEqual(spf.final_output_dims(dit), (96, 32))
+
     def test_attention_uses_public_containers_and_preferred_backend(self):
         q = torch.randn(1, 2, 3, 4)
         k = torch.randn(1, 2, 3, 4)

@@ -27,6 +27,7 @@ from . import device as spdev
 from . import sp_group
 from .sp_forward import validate_transformer_options
 
+import comfy.ldm.minimax.model as h3_model
 from comfy.ldm.minimax.model import Attention, DiTBlock, FinalLayer, MiniMaxH3Model, PackedLayout
 from comfy.patcher_extension import CallbacksMP
 import comfyui_version
@@ -49,10 +50,15 @@ def check_h3_api():
         problems.append("Attention does not expose comfy_attention")
     if "attention" not in inspect.signature(DiTBlock.forward).parameters:
         problems.append("DiTBlock.forward does not accept attention")
-    final_required = {"sigma", "sample_sigmas", "shifts"}
-    final_missing = final_required.difference(inspect.signature(FinalLayer.forward).parameters)
+    final_params = inspect.signature(FinalLayer.forward).parameters
+    final_missing = {"sigma", "sample_sigmas"}.difference(final_params)
+    if "shifts" not in final_params and "grids" not in final_params:
+        final_missing.add("shifts or grids")
     if final_missing:
         problems.append(f"FinalLayer.forward is missing {', '.join(sorted(final_missing))}")
+    elif "grids" in final_params and (not hasattr(h3_model, "pdd_grid")
+                                      or not hasattr(FinalLayer, "pdd_steps")):
+        problems.append("FinalLayer.forward takes grids but pdd_grid/FinalLayer.pdd_steps are missing")
     if problems:
         raise RuntimeError("MiniMax SP requires the H3 API introduced by ComfyUI commit 8d534945: "
                            + "; ".join(problems) + ". Update ComfyUI and restart it.")
@@ -187,7 +193,13 @@ class MiniMaxH3SPUNETLoader(io.ComfyNode):
             group = sp_group.get_group(world_size, unet_name, weight_dtype, picked, backend)
             group.sync_patches(patcher)
 
+        def cleanup(patcher):
+            group = sp_group.active_group()
+            if group is not None:
+                group.cleanup()
+
         model.add_callback_with_key(CallbacksMP.ON_PRE_RUN, "minimax_sp_lora", sync_patches)
+        model.add_callback_with_key(CallbacksMP.ON_CLEANUP, "minimax_sp_cleanup", cleanup)
         # ModelPatcher installs/restores the inner call without bypassing outer wrappers.
         model.add_object_patch("diffusion_model._forward", sp_entry)
         logging.info(f"[minimax_sp] sequence parallel enabled, world_size={world_size} "

@@ -1,9 +1,9 @@
 """Rank-0 side of the MiniMax-H3 Ulysses sequence-parallel group.
 
 Rank 0 is the ComfyUI process itself; ranks 1..P-1 are thin worker processes that
-hold only the DiT and do nothing but sequence-parallel forwards. Each worker gets
-its own device mask (CUDA_VISIBLE_DEVICES=<id> on CUDA, ZE_AFFINITY_MASK=<id> on
-Intel XPU) so ComfyUI's own device plumbing stays untouched.
+hold only the DiT and do nothing but sequence-parallel forwards. CUDA workers get
+their own CUDA_VISIBLE_DEVICES mask; XPU workers share visibility and bind their
+assigned device so oneCCL can discover both cards.
 
 Per step, rank 0 broadcasts a small metadata dict over the Gloo control group and
 the input tensors over a dedicated NCCL/XCCL group, then all ranks run the identical
@@ -12,6 +12,7 @@ cache-invalidation class of bugs.
 """
 
 import atexit
+from contextlib import nullcontext
 import json
 import logging
 import os
@@ -322,8 +323,14 @@ class SPGroup:
             time.sleep(0.2)
 
     def _startup_probe(self):
-        startup_probe(0, self.world, self.tensor_pg, spdev.rank0_device(self.backend or spdev.CUDA),
-                      self.bounded_timeout)
+        with self._monitor_collectives():
+            startup_probe(0, self.world, self.tensor_pg, spdev.rank0_device(self.backend or spdev.CUDA),
+                          self.bounded_timeout)
+
+    def _monitor_collectives(self):
+        if self.backend == spdev.XPU:
+            return spdev.CollectiveMonitor(self.procs, self.log_paths, self.collective_timeout)
+        return nullcontext()
 
     def check_alive(self):
         for r, p in enumerate(self.procs, start=1):
@@ -360,6 +367,12 @@ class SPGroup:
 
     def forward(self, dit, x, timestep, context, transformer_options, payload,
                 denoise_mask=None, audio_denoise_mask=None):
+        with self._monitor_collectives():
+            return self._forward(dit, x, timestep, context, transformer_options, payload,
+                                 denoise_mask, audio_denoise_mask)
+
+    def _forward(self, dit, x, timestep, context, transformer_options, payload,
+                 denoise_mask=None, audio_denoise_mask=None):
         self.check_alive()
         if not self.patches_ready:
             raise RuntimeError("MiniMax SP denoise prohibited: patches have not been acknowledged")
@@ -419,8 +432,44 @@ class SPGroup:
             self.destroy()
             raise
 
+    def cleanup(self):
+        """Mirror the sampling node's worker-side memory cleanup before the next prompt."""
+        self.check_alive()
+        self.patches_ready = False
+        try:
+            with self._monitor_collectives():
+                dist.broadcast_object_list([{"op": "cleanup"}], src=0, group=self.control_pg)
+                ready = [None] * self.world
+                dist.all_gather_object(ready, {"ready": True}, group=self.control_pg)
+                if any(reply != {"ready": True} for reply in ready):
+                    raise RuntimeError(f"MiniMax SP worker cleanup failed: {ready}")
+                logging.info("[minimax_sp] all ranks completed sampler cleanup")
+        except Exception:
+            logging.exception("[minimax_sp] worker cleanup failed")
+            self.destroy()
+            raise
+        self.release_rank0_cache()
+
+    def release_rank0_cache(self):
+        """Return the sampler's dead allocator cache before rank 0 decodes.
+
+        DynamicVRAM can evict model weights but cannot reclaim PyTorch's cached
+        blocks, so a following VAE decode may otherwise fail to page in weights.
+        """
+        if self.backend == spdev.CPU:
+            return
+        device = spdev.rank0_device(self.backend)
+        before = spdev.memory_reserved(device)
+        comfy.model_management.soft_empty_cache()
+        after = spdev.memory_reserved(device)
+        logging.info("[minimax_sp] rank 0 released %.0f MiB of cached sampler memory "
+                     "(reserved %.0f -> %.0f MiB, allocated %.0f MiB)",
+                     (before - after) / 2**20, before / 2**20, after / 2**20,
+                     spdev.memory_allocated(device) / 2**20)
+
     def destroy(self):
         # Do not broadcast shutdown into a failed collective.
+        spdev.stop_collective_monitor()
         self.patches_ready = False
         atexit.unregister(self.shutdown)
         for process in getattr(self, "procs", []):

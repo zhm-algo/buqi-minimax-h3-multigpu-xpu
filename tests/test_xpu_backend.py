@@ -3,9 +3,11 @@ from datetime import timedelta
 import json
 import os
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, call, patch
+import weakref
 
 import torch
 
@@ -360,6 +362,51 @@ class BoundedCollectiveTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "timed out"):
             spdev.run_collective(Mock(return_value=work), timeout=timedelta(seconds=7))
 
+    def test_all_to_all_bounds_both_directions_without_changing_shapes(self):
+        timeout = timedelta(seconds=7)
+        ctx = spf.SPContext(0, 2, "tensor-group", 4, timeout=timeout)
+        works = []
+
+        def exchange(out, source, **kwargs):
+            self.assertTrue(kwargs["async_op"])
+            self.assertEqual(kwargs["group"], "tensor-group")
+            out.copy_(torch.arange(out.numel(), dtype=out.dtype))
+            work = Mock()
+            works.append(work)
+            return work
+
+        with patch.object(spf.dist, "all_to_all_single", side_effect=exchange):
+            gathered = spf.a2a_gather_seq_scatter_heads(torch.zeros(2, 4, 3), ctx)
+            restored = spf.a2a_scatter_seq_gather_heads(gathered.reshape(4, 6), ctx)
+        self.assertEqual(gathered.shape, (4, 2, 3))
+        self.assertEqual(restored.shape, (2, 12))
+        self.assertEqual(len(works), 2)
+        for work in works:
+            work.wait.assert_called_once_with(timeout)
+
+    def test_attention_releases_full_sequence_qkv_before_output_exchange(self):
+        gathered_refs = []
+        attn = SimpleNamespace(
+            heads=4, head_dim=3, qkv_proj=lambda x: torch.zeros(2, 36),
+            q_norm=torch.nn.Identity(), k_norm=torch.nn.Identity(), out_proj=torch.nn.Identity())
+        ctx = spf.SPContext(0, 2, "group", 4)
+
+        def gather(tensor, context):
+            out = torch.ones(4, 2, 3)
+            gathered_refs.append(weakref.ref(out))
+            return out
+
+        def scatter(tensor, context):
+            self.assertEqual(len(gathered_refs), 3)
+            self.assertTrue(all(ref() is None for ref in gathered_refs))
+            return torch.zeros(2, 12)
+
+        with patch.object(spf, "a2a_gather_seq_scatter_heads", side_effect=gather), \
+                patch.object(spf, "run_optimized_attention", new=lambda *a: torch.zeros(1, 4, 6)), \
+                patch.object(spf, "a2a_scatter_seq_gather_heads", side_effect=scatter):
+            result = spf.sp_attention(attn, torch.zeros(2, 12), None, ctx, {})
+        self.assertEqual(result.shape, (2, 12))
+
     def test_bounded_wait_on_real_gloo_group(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = torch.distributed.FileStore(os.path.join(tmp, "store"), 1)
@@ -424,6 +471,74 @@ class BoundedCollectiveTests(unittest.TestCase):
                 patch.object(spg.spf, "sp_forward", return_value="out") as forward:
             group.forward(None, [source], None, None, {}, None)
         self.assertEqual(forward.call_args.kwargs["collective_timeout"], timedelta(seconds=11))
+
+
+class CollectiveMonitorTests(unittest.TestCase):
+    def test_worker_exit_is_logged_even_while_host_call_is_blocked(self):
+        reported = threading.Event()
+        process = Mock()
+        process.poll.return_value = -9
+        work = Mock()
+
+        def blocked_enqueue(**kwargs):
+            self.assertTrue(reported.wait(timeout=2), "monitor did not report the failed worker")
+            return work
+
+        with patch.object(spdev.CollectiveMonitor, "_poll_interval", 0.01), \
+                patch.object(spdev.logging, "critical", side_effect=lambda *a: reported.set()) as log, \
+                patch.object(spdev.os, "_exit") as terminate:
+            with spdev.CollectiveMonitor([process], {1: "worker1.log"}, timedelta(seconds=7)):
+                spdev.run_collective(blocked_enqueue, timeout=timedelta(seconds=7))
+            log.assert_called_once()
+            self.assertIn("NOT be terminated automatically", log.call_args.args[0])
+            self.assertIn("worker1.log", log.call_args.args)
+            terminate.assert_not_called()
+
+    def test_host_enqueue_timeout_is_logged_before_wait_is_reached(self):
+        monitor = spdev.CollectiveMonitor([], {}, timedelta(seconds=7))
+
+        def blocked_enqueue(**kwargs):
+            self.assertEqual(monitor.active[0], "blocked_enqueue")
+            with patch.object(spdev.time, "monotonic", return_value=monitor.active[1] + 8):
+                self.assertTrue(monitor._check())
+            return Mock()
+
+        with patch.object(spdev.logging, "critical") as log:
+            with monitor:
+                spdev.run_collective(blocked_enqueue, timeout=timedelta(seconds=7))
+            log.assert_called_once()
+            self.assertIn("host-side enqueue", log.call_args.args[0])
+        self.assertIsNone(monitor.active)
+        self.assertIsNone(spdev._COLLECTIVE_MONITOR.current)
+
+    def test_idle_or_computing_rank_does_not_trigger_collective_timeout(self):
+        process = Mock()
+        process.poll.return_value = None
+        monitor = spdev.CollectiveMonitor([process], {1: "worker.log"}, timedelta(seconds=7))
+        with patch.object(spdev.time, "monotonic", return_value=1e9), \
+                patch.object(spdev.logging, "critical") as log:
+            self.assertFalse(monitor._check())
+        log.assert_not_called()
+
+    def test_exception_stops_monitor_and_clears_active_operation(self):
+        monitor = spdev.CollectiveMonitor([], {}, timedelta(seconds=7))
+        with self.assertRaisesRegex(RuntimeError, "enqueue failed"):
+            with monitor:
+                spdev.run_collective(Mock(side_effect=RuntimeError("enqueue failed")),
+                                     timeout=timedelta(seconds=7))
+        self.assertIsNone(monitor.active)
+        self.assertFalse(monitor._thread.is_alive())
+        self.assertIsNone(spdev._COLLECTIVE_MONITOR.current)
+
+    def test_intentional_teardown_stops_monitor_before_killing_workers(self):
+        process = Mock()
+        process.poll.return_value = None
+        with patch.object(spdev.logging, "critical") as log:
+            with spdev.CollectiveMonitor([process], {1: "worker.log"}, timedelta(seconds=7)) as monitor:
+                spdev.stop_collective_monitor()
+                process.poll.return_value = -9
+                self.assertFalse(monitor._thread.is_alive())
+            log.assert_not_called()
 
 
 def _forward_meta():

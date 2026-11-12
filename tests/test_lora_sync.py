@@ -24,6 +24,34 @@ def fake_patcher(with_patches=True):
 
 
 class PatchSyncTests(unittest.TestCase):
+    def test_cleanup_releases_dynamic_state_and_preserves_patch_version(self):
+        patcher = fake_patcher(False)
+        patcher.cleanup = Mock()
+        worker = sync.WorkerPatches(patcher, 1)
+        worker.ready, worker.version = True, "four"
+        for dynamic in (False, True):
+            with self.subTest(dynamic=dynamic), \
+                    patch.object(sync.comfy.memory_management, "aimdo_enabled", dynamic), \
+                    patch.object(sync.comfy.model_prefetch, "cleanup_prefetch_queues") as prefetch, \
+                    patch.object(sync.comfy.model_management, "reset_cast_buffers") as casts, \
+                    patch("comfy_aimdo.model_vbar.vbars_reset_watermark_limits") as watermarks:
+                self.assertEqual(worker.cleanup(), {"ready": True})
+                self.assertFalse(worker.ready)
+                self.assertEqual(worker.version, "four")
+                prefetch.assert_called_once_with()
+                self.assertEqual(casts.call_count, int(dynamic))
+                self.assertEqual(watermarks.call_count, int(dynamic))
+        self.assertEqual(patcher.cleanup.call_count, 2)
+
+    def test_cleanup_failure_cannot_acknowledge_success(self):
+        patcher = fake_patcher(False)
+        patcher.cleanup = Mock(side_effect=RuntimeError("cleanup failed"))
+        worker = sync.WorkerPatches(patcher, 1)
+        worker.ready = True
+        with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+            worker.cleanup()
+        self.assertFalse(worker.ready)
+
     def test_initial_empty_manifest_only_marks_worker_ready(self):
         parent, child = fake_patcher(False), fake_patcher(False)
         worker = sync.WorkerPatches(child, 1)

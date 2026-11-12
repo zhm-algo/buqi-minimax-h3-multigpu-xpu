@@ -6,7 +6,7 @@ A ComfyUI custom node that runs the MiniMax H3 DiT with Ulysses sequence paralle
 
 ## Compatibility and status
 
-- Requires the MiniMax H3 API introduced at or after ComfyUI commit **`8d534945`**; startup uses a runtime capability check instead of a release-version claim.
+- Requires the MiniMax H3 API introduced at or after ComfyUI commit **`8d534945`**; startup uses a runtime capability check instead of a release-version claim. Both the `shifts` final-layer API (e.g. ComfyUI 0.39) and the per-step PDD `grids` API (ComfyUI 0.45) are supported.
 - Tested against the current ComfyUI 0.37 development commit **`7fbcfa8be9a8f47cf905ec47978b5bd754959ea7`**.
 - The old ComfyUI 0.30 integration belongs to older releases; the main branch no longer claims compatibility with it.
 - Platform: Linux or WSL2 with PyTorch/NCCL for NVIDIA; Linux with a PyTorch XPU/XCCL build for Intel (see [Intel Arc Pro B70](#intel-arc-pro-b70-xpu)). Native Windows multi-GPU is not supported.
@@ -122,7 +122,9 @@ Worker visibility (`MINIMAX_SP_XPU_VISIBILITY`):
 
 Process groups: on XPU the XCCL tensor group is the default process group and the Gloo control plane is a subgroup. The CUDA layout (Gloo default group, NCCL subgroup) hangs XCCL's first collective on B70.
 
-Timeouts: XCCL has no NCCL-style watchdog, so on XPU the startup probe and the final gather of every forward wait with an explicit `MINIMAX_SP_COLLECTIVE_TIMEOUT` bound. A forward's collectives run in order on one stream, so this also catches hangs in its all-to-alls. The bound starts when the final gather is enqueued and must exceed one DiT forward at your resolution (default 120 s). A timed-out XCCL collective stays queued on the card, so ComfyUI's own cleanup (`torch.xpu.synchronize`) can block after the error; restart ComfyUI after an XCCL timeout.
+Timeouts: XCCL has no NCCL-style watchdog, so on XPU the startup probe, each all-to-all, and the final gathers wait with an explicit `MINIMAX_SP_COLLECTIVE_TIMEOUT` bound (default 120 s per collective, including earlier queued GPU work). Waiting at each exchange also bounds temporary-buffer lifetime on long sequences. An independent CPU monitor logs worker exits and host-side enqueue stalls even if XCCL never returns a work handle. It only logs: it does not cancel a blocked driver call or automatically terminate ComfyUI. A failed XCCL collective can leave GPU work queued and block ComfyUI's cleanup (`torch.xpu.synchronize`); restart ComfyUI, or the container if pinned-memory transfers remain stuck.
+
+Worker memory lifecycle: the loader's `ON_CLEANUP` callback sends an acknowledged cleanup command after sampling. Workers release prefetch state and, with DynamicVRAM enabled, reset cast buffers and VBAR watermark limits just as ComfyUI does after a node. This prevents sampler state from persisting across different resolutions/durations. Full-sequence Q/K/V tensors are released before the output exchange. These changes reduce memory pressure but cannot guarantee that every long-video shape fits in VRAM.
 
 XPU acceptance:
 
@@ -192,7 +194,7 @@ The parity and lifecycle scripts exit nonzero on failure. `tests/selftest.py` is
 | `MINIMAX_SP_BACKEND` | `auto` | `auto` (CUDA, then Intel XPU), `cuda`, or `xpu`; `cpu` is for tests only |
 | `MINIMAX_SP_XPU_VISIBILITY` | `shared` | Intel XPU worker visibility: `shared` or `isolated` |
 | `MINIMAX_SP_STARTUP_TIMEOUT` | 300 s | Worker/process-group startup timeout |
-| `MINIMAX_SP_COLLECTIVE_TIMEOUT` | 120 s | NCCL collective timeout; on Intel XPU, the wait bound for the startup probe and each forward's final gather |
+| `MINIMAX_SP_COLLECTIVE_TIMEOUT` | 120 s | NCCL collective timeout; on Intel XPU, each probe/all-to-all/final gather wait and host enqueue stall warning |
 | `MINIMAX_SP_LOGDIR` | system temp directory | Worker log directory (`minimax_sp_worker<N>.log`) |
 | `MINIMAX_SP_VERIFY=1` | off | Compare the first SP result with native H3 before accepting it |
 | `MINIMAX_SP_PROFILE=1` | off | Forward timing logs |
@@ -204,7 +206,7 @@ Common failures:
 - **Native Windows error:** use WSL2 or Linux; NCCL is required. Intel XPU multi-GPU needs Linux.
 - **GPU visibility/P2P/startup probe failure:** verify `--cuda-device`, `MINIMAX_SP_DEVICES`, `nvidia-smi`, and NCCL/P2P availability. Increase `MINIMAX_SP_STARTUP_TIMEOUT` only if model loading is genuinely slow.
 - **XCCL startup probe failure (Intel XPU):** verify `ZE_AFFINITY_MASK`/`ONEAPI_DEVICE_SELECTOR`/`MINIMAX_SP_DEVICES` against `sycl-ls`, keep the default `MINIMAX_SP_XPU_VISIBILITY=shared` (a `comm_dev_uuids is not sub-vector` warning in the worker log means the ranks see different cards), make sure PCIe P2P between the cards is not blocked (ACS/IOMMU settings), and rerun with `CCL_LOG_LEVEL=info`. oneCCL settings reported to help on multi-Arc systems, one at a time: `CCL_ZE_IPC_EXCHANGE=sockets`, `CCL_TOPO_P2P_ACCESS=0` (disables P2P; slower), `CCL_ENABLE_SYCL_KERNELS=0`, `SYCL_UR_USE_LEVEL_ZERO_V2=0`. Restart ComfyUI after a timed-out probe.
-- **Collective timeout or worker exit:** inspect every worker log in `MINIMAX_SP_LOGDIR`; the rank-specific traceback is authoritative. Fix the underlying OOM, device mapping, or unsupported patch instead of repeatedly extending the timeout.
+- **Collective timeout or worker exit:** inspect every worker log in `MINIMAX_SP_LOGDIR`; the rank-specific traceback is authoritative. Level Zero `OUT_OF_DEVICE_MEMORY` / `OUT_OF_RESOURCES` on one rank can leave its peer blocked inside XCCL. The monitor reports this without auto-exiting ComfyUI. Restart ComfyUI (the container if GPU transfers remain stuck), and reduce resolution/duration if needed rather than repeatedly extending the timeout.
 - **Deprecated VAE node warning:** replace `MiniMaxH3SPVAEDecode` with standard `VAEDecode`; both now call the official decode path.
 - **Changed model/dtype/world size:** restart ComfyUI before creating a different SP group.
 

@@ -6,7 +6,7 @@
 
 ## 兼容性与验证范围
 
-- 要求 ComfyUI commit **`8d534945`** 或之后引入的 MiniMax H3 API；启动时由能力检查判断，不声明精确 release tag 范围。
+- 要求 ComfyUI commit **`8d534945`** 或之后引入的 MiniMax H3 API；启动时由能力检查判断，不声明精确 release tag 范围。同时支持 `shifts` 形式的 final layer API（如 ComfyUI 0.39）和按步 PDD `grids` 形式的 API（ComfyUI 0.45）。
 - 已测试当前 ComfyUI 0.37 开发提交：**`7fbcfa8be9a8f47cf905ec47978b5bd754959ea7`**。
 - ComfyUI 0.30 接口只属于旧版本；main 不再声明兼容。
 - NVIDIA：Linux 或 WSL2 + PyTorch/NCCL；Intel：Linux + 带 XCCL 的 PyTorch XPU 版本（见 [Intel Arc Pro B70](#intel-arc-pro-b70xpu)）。不支持原生 Windows 多卡。
@@ -116,7 +116,9 @@ worker 可见性（`MINIMAX_SP_XPU_VISIBILITY`）：
 
 进程组：XPU 上 XCCL tensor 组是默认进程组，Gloo 控制面是子组。CUDA 的布局（Gloo 默认组 + NCCL 子组）在 B70 上会让 XCCL 的第一个 collective 卡死。
 
-超时：XCCL 没有 NCCL 那样的 watchdog，因此 XPU 上 startup probe 和每次 forward 最后的 gather 会用 `MINIMAX_SP_COLLECTIVE_TIMEOUT` 显式限时等待。同一 forward 的 collective 在同一 stream 上顺序执行，所以也能发现前面 all-to-all 的卡死。计时从最后的 gather 入队开始，必须大于当前分辨率下一次 DiT forward 的耗时（默认 120 秒）。超时的 XCCL collective 仍留在卡上的队列中，ComfyUI 自身的清理（`torch.xpu.synchronize`）可能在报错后阻塞；XCCL 超时后请重启 ComfyUI。
+超时：XCCL 没有 NCCL 那样的 watchdog，因此 XPU 上 startup probe、每次 all-to-all 和最终 gather 都使用 `MINIMAX_SP_COLLECTIVE_TIMEOUT` 显式等待（默认每次 collective 120 秒，包含前面排队的 GPU 工作）。逐次等待也限制了长序列通信临时缓冲区的存活时间。独立 CPU 监视线程会记录 worker 退出及主机侧入队卡死，即使 XCCL 尚未返回 work handle 也能报错。它只记录日志，不会取消驱动调用或自动退出 ComfyUI。失败的 XCCL 可能让 GPU 工作一直排队，连 ComfyUI 清理时的 `torch.xpu.synchronize` 也会阻塞；请重启 ComfyUI，若锁页内存传输仍卡住则重启容器。
+
+worker 内存生命周期：loader 的 `ON_CLEANUP` 回调会在采样结束后发送并确认 cleanup 命令。worker 清理 prefetch 状态；启用 DynamicVRAM 时，还会像 ComfyUI 节点结束时一样重置 cast buffer 和 VBAR watermark limit，避免不同分辨率/时长的任务之间残留采样状态。全序列 Q/K/V 在输出通信前释放。这些改动降低显存压力，但不保证任意长视频尺寸都能装入显存。
 
 XPU 验收：
 
@@ -186,7 +188,7 @@ COMFYUI_ROOT=/path/to/ComfyUI python tests/runtime_recovery.py \
 | `MINIMAX_SP_BACKEND` | `auto` | `auto`（先 CUDA 再 Intel XPU）、`cuda` 或 `xpu`；`cpu` 仅用于测试 |
 | `MINIMAX_SP_XPU_VISIBILITY` | `shared` | Intel XPU worker 可见性：`shared` 或 `isolated` |
 | `MINIMAX_SP_STARTUP_TIMEOUT` | 300 秒 | worker/进程组启动超时 |
-| `MINIMAX_SP_COLLECTIVE_TIMEOUT` | 120 秒 | NCCL collective 超时；Intel XPU 上为 startup probe 和每次 forward 最终 gather 的等待上限 |
+| `MINIMAX_SP_COLLECTIVE_TIMEOUT` | 120 秒 | NCCL collective 超时；Intel XPU 上每次 probe/all-to-all/最终 gather 的等待上限及主机入队停滞告警 |
 | `MINIMAX_SP_LOGDIR` | 系统临时目录 | `minimax_sp_worker<N>.log` 所在目录 |
 | `MINIMAX_SP_VERIFY=1` | 关闭 | 首次 SP 输出与原生 H3 对比后才接受 |
 | `MINIMAX_SP_PROFILE=1` | 关闭 | forward 耗时 |
@@ -196,7 +198,7 @@ COMFYUI_ROOT=/path/to/ComfyUI python tests/runtime_recovery.py \
 - **原生 Windows 报错**：改用 WSL2 或 Linux，SP 需要 NCCL；Intel XPU 多卡需要 Linux。
 - **GPU visibility/P2P/startup probe 失败**：检查 `--cuda-device`、`MINIMAX_SP_DEVICES`、`nvidia-smi` 与 NCCL/P2P。只有确实加载较慢时才提高 startup timeout。
 - **XCCL startup probe 失败（Intel XPU）**：对照 `sycl-ls` 检查 `ZE_AFFINITY_MASK`/`ONEAPI_DEVICE_SELECTOR`/`MINIMAX_SP_DEVICES`，保持默认的 `MINIMAX_SP_XPU_VISIBILITY=shared`（worker 日志中的 `comm_dev_uuids is not sub-vector` 警告表示各 rank 看到的卡不同），确认卡间 PCIe P2P 未被 ACS/IOMMU 设置阻断，并用 `CCL_LOG_LEVEL=info` 重跑。多 Arc 系统上有报告称以下 oneCCL 设置有帮助，请逐个尝试：`CCL_ZE_IPC_EXCHANGE=sockets`、`CCL_TOPO_P2P_ACCESS=0`（关闭 P2P，较慢）、`CCL_ENABLE_SYCL_KERNELS=0`、`SYCL_UR_USE_LEVEL_ZERO_V2=0`。probe 超时后请重启 ComfyUI。
-- **collective timeout/worker 退出**：查看 `MINIMAX_SP_LOGDIR` 中每个 rank 的日志；先修复 OOM、设备映射或不支持 patch，不要只反复加大 timeout。
+- **collective timeout/worker 退出**：查看 `MINIMAX_SP_LOGDIR` 中每个 rank 的日志。单个 rank 的 Level Zero `OUT_OF_DEVICE_MEMORY` / `OUT_OF_RESOURCES` 可能让另一端一直卡在 XCCL 中；监视线程会报错，但不自动退出 ComfyUI。重启 ComfyUI（GPU 传输仍卡住时重启容器），必要时降低分辨率/时长，不要只反复加大 timeout。
 - **VAE 节点 deprecated warning**：把 `MiniMaxH3SPVAEDecode` 替换为标准 `VAEDecode`；两者现在都走官方解码。
 - **更换 checkpoint/dtype/world size**：重启 ComfyUI 后再建新 SP 组。
 

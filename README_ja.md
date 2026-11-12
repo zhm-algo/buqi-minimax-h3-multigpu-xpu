@@ -6,7 +6,7 @@ ComfyUI MiniMax H3 用の Ulysses シーケンス並列ローダーです。複�
 
 ## 互換性
 
-- ComfyUI commit **`8d534945`** 以降で導入された MiniMax H3 API が必要です。release tag ではなく起動時の capability check で判定します。
+- ComfyUI commit **`8d534945`** 以降で導入された MiniMax H3 API が必要です。release tag ではなく起動時の capability check で判定します。`shifts` 形式の final layer API（例: ComfyUI 0.39）とステップ別 PDD `grids` 形式の API（ComfyUI 0.45）の両方に対応します。
 - 現在の ComfyUI 0.37 development commit **`7fbcfa8be9a8f47cf905ec47978b5bd754959ea7`** で検証済みです。
 - ComfyUI 0.30 は旧 release の対象で、main branch の対象外です。
 - NVIDIA: Linux または WSL2 + NCCL。Intel: Linux + XCCL 対応 PyTorch XPU（[Intel Arc Pro B70](#intel-arc-pro-b70xpu) 参照）。Windows native の multi-GPU は非対応です。
@@ -44,7 +44,8 @@ ZE_AFFINITY_MASK=0,1 MINIMAX_SP_DEVICES=0,1 python main.py
 - worker は rank 0 の DynamicVRAM 状態に従います。XPU DynamicVRAM（`--enable-dynamic-vram`）は [ComfyUI-OmniXPU](https://github.com/intel/llm-scaler/tree/main/omni/ComfyUI-OmniXPU) の `comfy_aimdo.xpu` runtime provider 経由で対応します。各 worker は rank 0 の環境（`AIMDO_XPU_ALLOCATOR_MODE`・`LD_PRELOAD`・`OMNIXPU_*`）を継承し、ComfyUI と同じ順序で処理します：PyTorch の import 前に OmniXPU の `prestartup_script.py` を実行し、自分のカードで AIMDO を初期化してから OmniXPU adapter を読み込みます。worker の有効 runtime provider が rank 0 と異なる場合は起動エラーになります。adapter の差異（rank 0 でのみ実行される SeedVR2/VAE 前処理 adapter など）は worker ログに警告として出力されます。provider なしで XPU DynamicVRAM が有効な場合は worker 起動前に拒否します。DynamicVRAM 無効時（`--disable-dynamic-vram` または OmniXPU なし）は通常の ComfyUI メモリ管理を使います。OmniXPU がインストールされていれば provider と adapter は引き続き再現され、全 rank が同じ XPU kernel を使います。NVIDIA の DynamicVRAM 動作は変わりません。最初は `--highvram` を付けず、FP8-scaled checkpoint で確認してください。
 - `MINIMAX_SP_XPU_VISIBILITY=shared`（既定）: worker は ComfyUI の可視性を継承し番号で選択するため、全 SP カードを ComfyUI から見える状態にしてください。`isolated`: 各 worker は `ZE_AFFINITY_MASK=<自分のカード>` で起動します。非推奨：Arc Pro B70 + PyTorch 2.14 XCCL では rank ごとに mask が異なると oneCCL がデバイスを対応付けられず（worker ログに `comm_dev_uuids is not sub-vector of node_dev_uuids`）、最初の all-to-all がハングします。
 - XPU では XCCL の tensor group を default process group とし、Gloo の control plane を subgroup にします。CUDA と同じ構成（Gloo default + NCCL subgroup）では B70 上で XCCL の最初の collective がハングします。
-- XCCL には NCCL のような watchdog がないため、XPU では startup probe と各 forward 最後の gather を `MINIMAX_SP_COLLECTIVE_TIMEOUT` で明示的に待ちます。計測は gather の enqueue 時点から始まるため、1 回の DiT forward より長く設定してください（既定 120 秒）。タイムアウトした XCCL collective はカード上のキューに残り、ComfyUI 自身の後処理（`torch.xpu.synchronize`）がブロックすることがあるので、XCCL タイムアウト後は ComfyUI を再起動してください。
+- XCCL には NCCL のような watchdog がないため、XPU では startup probe、各 all-to-all、最後の gather を `MINIMAX_SP_COLLECTIVE_TIMEOUT` で明示的に待ちます（既定は collective ごとに 120 秒、先行 GPU 処理を含む）。各交換で待つことで長いシーケンスの一時バッファ寿命も制限します。独立した CPU 監視スレッドは worker 終了とホスト側 enqueue 停滞を記録しますが、ドライバ呼び出しを中断したり ComfyUI を自動終了したりはしません。XCCL 失敗後は ComfyUI を、メモリ転送がまだ停止している場合はコンテナを再起動してください。
+- サンプリング後の `ON_CLEANUP` callback は worker に cleanup コマンドを送り、ACK を待ちます。worker は prefetch 状態と、DynamicVRAM 使用時は cast buffer / VBAR watermark limit をリセットします。全シーケンスの Q/K/V は出力交換前に解放します。メモリ圧力を軽減しますが、任意の長さ・解像度が VRAM に収まる保証はありません。
 
 **OmniXPU/container**（例: llm-scaler の `start_comfyui.sh`）: 既定の `--enable-dynamic-vram` のままにし、entrypoint に `native_hook` allocator とその `LD_PRELOAD` を設定させてください。worker はそれを継承します。DynamicVRAM を無効にする場合は entrypoint に `--disable-dynamic-vram` を渡し、shell／コンテナ環境に `AIMDO_XPU_ALLOCATOR_MODE=native_hook` が残っていないことを確認してください。あわせて `LD_PRELOAD` から `aimdo_xpu.so` を外してください。そうしないと ComfyUI は `[OmniXPU] explicit native_hook requires a compatible AIMDO provider and DynamicVRAM`（entrypoint では `native_hook requires DynamicVRAM`）で終了します。
 
@@ -111,7 +112,7 @@ GPU tensor parity と実際の loader/SPGroup lifecycle command は [English REA
 - `MINIMAX_SP_BACKEND=auto`: `auto` / `cuda` / `xpu`（`cpu` はテスト専用）。
 - `MINIMAX_SP_XPU_VISIBILITY=shared`: Intel XPU worker の可視性（`shared` / `isolated`）。
 - `MINIMAX_SP_STARTUP_TIMEOUT=300`: startup timeout（秒）。
-- `MINIMAX_SP_COLLECTIVE_TIMEOUT=120`: collective timeout（秒）。Intel XPU では startup probe と各 forward 最後の gather の待機上限。
+- `MINIMAX_SP_COLLECTIVE_TIMEOUT=120`: collective timeout（秒）。Intel XPU では各 probe/all-to-all/最終 gather の待機上限とホスト enqueue 停滞警告。
 - `MINIMAX_SP_LOGDIR=/path`: `minimax_sp_worker<N>.log` の保存先。
 
 ノードが出ない場合は clone 先と root `__init__.py`、ComfyUI 起動ログを確認してください。P2P/startup/collective failure は `nvidia-smi`、device mapping、NCCL と各 worker log を確認します。Intel XPU の XCCL probe が失敗する場合は `sycl-ls` と `ZE_AFFINITY_MASK`/`MINIMAX_SP_DEVICES` を照合し、`MINIMAX_SP_XPU_VISIBILITY=shared`、ACS/IOMMU による PCIe P2P のブロック、`CCL_LOG_LEVEL=info` のログを確認してください。旧 VAE node の deprecated warning が出たら標準 `VAEDecode` に置き換えてください。checkpoint/dtype/world size を変える場合は ComfyUI を再起動してください。

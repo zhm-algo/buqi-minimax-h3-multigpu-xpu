@@ -11,7 +11,9 @@ import os
 import tempfile
 
 import torch
+import comfy.memory_management
 import comfy.model_management
+import comfy.model_prefetch
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,16 @@ class WorkerPatches:
         self.memory_required = memory_required
         comfy.model_management.load_models_gpu([self.patcher], memory_required=memory_required)
         self.ready = self.version == version
+        return {"ready": True}
+
+    def cleanup(self):
+        self.ready = False
+        self.patcher.cleanup()
+        comfy.model_prefetch.cleanup_prefetch_queues()
+        if comfy.memory_management.aimdo_enabled:
+            import comfy_aimdo.model_vbar
+            comfy.model_management.reset_cast_buffers()
+            comfy_aimdo.model_vbar.vbars_reset_watermark_limits()
         return {"ready": True}
 
     def apply(self, manifest):

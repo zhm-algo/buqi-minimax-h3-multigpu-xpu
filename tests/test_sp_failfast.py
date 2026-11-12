@@ -42,6 +42,22 @@ def successful_gather(replies, local, **kwargs):
 
 
 class SPFailFastTests(unittest.TestCase):
+    def test_cleanup_failure_destroys_group_and_denies_another_forward(self):
+        group = spg.SPGroup.__new__(spg.SPGroup)
+        group.world, group.control_pg = 2, object()
+        group.patches_ready = True
+        group.check_alive, group.destroy = Mock(), Mock()
+
+        def rejected(replies, local, **kwargs):
+            replies[:] = [local, {"error": "cleanup failed"}]
+
+        with patch.object(spg.dist, "broadcast_object_list"), \
+                patch.object(spg.dist, "all_gather_object", side_effect=rejected):
+            with self.assertRaisesRegex(RuntimeError, "worker cleanup failed"):
+                group.cleanup()
+        self.assertFalse(group.patches_ready)
+        group.destroy.assert_called_once_with()
+
     def test_timeout_defaults_and_overrides(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(spg.positive_timeout("MINIMAX_SP_STARTUP_TIMEOUT", 300), timedelta(seconds=300))

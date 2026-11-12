@@ -1,5 +1,6 @@
 """Small CPU/Gloo parity checks for the current H3 conditioning and mask contract."""
 from datetime import timedelta
+import inspect
 import os
 import unittest
 
@@ -21,6 +22,19 @@ class TorchrunParityNotice(unittest.TestCase):
         self.skipTest("torchrun executes main() directly")
 
 
+def build_model(**kwargs):
+    model = MiniMaxH3Model(hidden_size=64, num_layers=2, token_refiner_num_layers=1,
+                           num_attention_heads=2, attention_head_dim=128, ffn_hidden_size=128,
+                           text_dim=64, timestep_input_dim=16, time_embed_hidden_size=64,
+                           time_embed_dim=32, dtype=torch.float32, device="cpu", operations=comfy.ops.manual_cast,
+                           **kwargs)
+    model.requires_grad_(False)
+    for p in model.parameters():
+        p.uniform_(-0.05, 0.05)
+    model.rope.inv_freq.fill_(0.01)
+    return model
+
+
 def main():
     torch.set_num_threads(1)
     dist.init_process_group("gloo", timeout=timedelta(seconds=90))
@@ -28,14 +42,7 @@ def main():
     if world != 2:
         raise RuntimeError(f"test_current_api.py requires exactly 2 ranks, got {world}")
     torch.manual_seed(17)
-    model = MiniMaxH3Model(hidden_size=64, num_layers=2, token_refiner_num_layers=1,
-                           num_attention_heads=2, attention_head_dim=128, ffn_hidden_size=128,
-                           text_dim=64, timestep_input_dim=16, time_embed_hidden_size=64,
-                           time_embed_dim=32, dtype=torch.float32, device="cpu", operations=comfy.ops.manual_cast)
-    model.requires_grad_(False)
-    for p in model.parameters():
-        p.uniform_(-0.05, 0.05)
-    model.rope.inv_freq.fill_(0.01)
+    model = build_model()
     x = [torch.randn(1, 24, 2, 4, 4), torch.randn(1, 32, 2, 3)]
     t = torch.tensor([500.0])
     context = torch.randn(1, 3, 64)
@@ -67,6 +74,16 @@ def main():
             for label, actual, expected in zip(("video", "audio"), got, ref):
                 torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
                 print(name, label, "PASS", "max_abs", float((actual-expected).abs().max()), flush=True)
+    # ComfyUI 0.45+ builds stacked PDD heads in the model and passes sigma grids to FinalLayer.
+    if "pdd_steps" in inspect.signature(MiniMaxH3Model).parameters:
+        pdd_model = build_model(pdd_steps=3)
+        options = {"sample_sigmas": torch.tensor([1.0, 0.5, 0.25, 0.0])}
+        ref = pdd_model._forward(x, t, context, transformer_options=options.copy())
+        got = spf.sp_forward(pdd_model, x, t, context, options.copy(), None, rank, world, None)
+        if rank == 0:
+            for label, actual, expected in zip(("video", "audio"), got, ref):
+                torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+                print("pdd_heads", label, "PASS", flush=True)
     # Intel XPU bounds the final gather with an explicit wait; run that path over Gloo too.
     ref = model._forward(x, t, context, transformer_options={})
     got = spf.sp_forward(model, x, t, context, {}, None, rank, world, None,
