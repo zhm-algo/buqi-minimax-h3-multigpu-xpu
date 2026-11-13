@@ -201,7 +201,7 @@ COMFYUI_ROOT=/path/to/ComfyUI python tests/runtime_recovery.py \
 - **XCCL startup probe 失败（Intel XPU）**：对照 `sycl-ls` 检查 `ZE_AFFINITY_MASK`/`ONEAPI_DEVICE_SELECTOR`/`MINIMAX_SP_DEVICES`，保持默认的 `MINIMAX_SP_XPU_VISIBILITY=shared`（worker 日志中的 `comm_dev_uuids is not sub-vector` 警告表示各 rank 看到的卡不同），确认卡间 PCIe P2P 未被 ACS/IOMMU 设置阻断，并用 `CCL_LOG_LEVEL=info` 重跑。多 Arc 系统上有报告称以下 oneCCL 设置有帮助，请逐个尝试：`CCL_ZE_IPC_EXCHANGE=sockets`、`CCL_TOPO_P2P_ACCESS=0`（关闭 P2P，较慢）、`CCL_ENABLE_SYCL_KERNELS=0`、`SYCL_UR_USE_LEVEL_ZERO_V2=0`。probe 超时后请重启 ComfyUI。
 - **collective timeout/worker 退出**：查看 `MINIMAX_SP_LOGDIR` 中每个 rank 的日志。单个 rank 的 Level Zero `OUT_OF_DEVICE_MEMORY` / `OUT_OF_RESOURCES` 可能让另一端一直卡在 XCCL 中；监视线程会报错，但不自动退出 ComfyUI。重启 ComfyUI（GPU 传输仍卡住时重启容器），必要时降低分辨率/时长，不要只反复加大 timeout。
 - **VAE 节点 deprecated warning**：把 `MiniMaxH3SPVAEDecode` 替换为标准 `VAEDecode`；两者现在都走官方解码。
-- **更换 checkpoint/dtype/world size**：重启 ComfyUI 后再建新 SP 组。
+- **更换 checkpoint/dtype/world size**：加载不同 checkpoint（如先 T2V 后 R2V）时会关闭正在运行的 worker 并新建 SP 组，worker 需要重新加载权重；交替使用不同 checkpoint 每次都要付出这段启动时间。
 
 ## 许可证
 

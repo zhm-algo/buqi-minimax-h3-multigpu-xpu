@@ -209,7 +209,7 @@ Common failures:
 - **XCCL startup probe failure (Intel XPU):** verify `ZE_AFFINITY_MASK`/`ONEAPI_DEVICE_SELECTOR`/`MINIMAX_SP_DEVICES` against `sycl-ls`, keep the default `MINIMAX_SP_XPU_VISIBILITY=shared` (a `comm_dev_uuids is not sub-vector` warning in the worker log means the ranks see different cards), make sure PCIe P2P between the cards is not blocked (ACS/IOMMU settings), and rerun with `CCL_LOG_LEVEL=info`. oneCCL settings reported to help on multi-Arc systems, one at a time: `CCL_ZE_IPC_EXCHANGE=sockets`, `CCL_TOPO_P2P_ACCESS=0` (disables P2P; slower), `CCL_ENABLE_SYCL_KERNELS=0`, `SYCL_UR_USE_LEVEL_ZERO_V2=0`. Restart ComfyUI after a timed-out probe.
 - **Collective timeout or worker exit:** inspect every worker log in `MINIMAX_SP_LOGDIR`; the rank-specific traceback is authoritative. Level Zero `OUT_OF_DEVICE_MEMORY` / `OUT_OF_RESOURCES` on one rank can leave its peer blocked inside XCCL. The monitor reports this without auto-exiting ComfyUI. Restart ComfyUI (the container if GPU transfers remain stuck), and reduce resolution/duration if needed rather than repeatedly extending the timeout.
 - **Deprecated VAE node warning:** replace `MiniMaxH3SPVAEDecode` with standard `VAEDecode`; both now call the official decode path.
-- **Changed model/dtype/world size:** restart ComfyUI before creating a different SP group.
+- **Changed model/dtype/world size:** loading a different checkpoint (e.g. T2V then R2V) shuts down the running workers and starts a new SP group, which reloads the worker weights; alternating checkpoints therefore pays that startup each time.
 
 ## License
 

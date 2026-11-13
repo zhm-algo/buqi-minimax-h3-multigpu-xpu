@@ -542,10 +542,16 @@ def active_group():
 def get_group(world, unet_name, weight_dtype, devices=None, backend=None):
     key = (world, unet_name, weight_dtype, tuple(devices) if devices else None)
     if key not in _GROUPS:
-        if _GROUPS:
-            raise RuntimeError("[minimax_sp] a different SP group is already running; restart ComfyUI "
-                               f"to change it (active: {list(_GROUPS)[0]})")
         if devices is None:
             raise ValueError("[minimax_sp] devices must be provided for a new SP group")
+        # One group per process: switching checkpoints (e.g. T2V -> R2V) replaces the workers.
+        for active_key, active in list(_GROUPS.items()):
+            logging.info("[minimax_sp] switching SP group %s -> %s; shutting down the running workers",
+                         active_key, key)
+            try:
+                active.shutdown()
+            finally:
+                active.destroy()
+                _GROUPS.pop(active_key, None)
         _GROUPS[key] = SPGroup(world, unet_name, weight_dtype, devices, backend=backend)
     return _GROUPS[key]

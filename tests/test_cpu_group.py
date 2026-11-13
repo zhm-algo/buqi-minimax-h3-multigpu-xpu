@@ -23,8 +23,8 @@ from minimax_sp import device as spdev
 from minimax_sp import sp_group
 
 
-def save_tiny_h3(path):
-    torch.manual_seed(17)
+def save_tiny_h3(path, seed=17):
+    torch.manual_seed(seed)
     model = MiniMaxH3Model(hidden_size=64, num_layers=2, token_refiner_num_layers=1,
                            num_attention_heads=2, attention_head_dim=128, ffn_hidden_size=128,
                            text_dim=64, timestep_input_dim=16, time_embed_hidden_size=64,
@@ -131,6 +131,58 @@ class CPUGroupLifecycleTests(unittest.TestCase):
                     procs = list(group.procs)
                     group.shutdown()
                     self.assertEqual([p.returncode for p in procs], [0])
+            except Exception:
+                log = os.path.join(tmp, "minimax_sp_worker1.log")
+                if os.path.exists(log):
+                    with open(log, encoding="utf-8", errors="replace") as f:
+                        print("worker log:\n" + f.read()[-4000:])
+                raise
+            finally:
+                if sp_group.active_group() is not None:
+                    sp_group.active_group().destroy()
+                paths.remove(tmp)
+
+    def test_loading_another_checkpoint_replaces_the_running_group(self):
+        # e.g. a T2V workflow followed by R2V in the same ComfyUI process.
+        with tempfile.TemporaryDirectory() as tmp:
+            save_tiny_h3(os.path.join(tmp, "tiny_a.safetensors"), seed=17)
+            save_tiny_h3(os.path.join(tmp, "tiny_b.safetensors"), seed=29)
+            env = {"MINIMAX_SP_BACKEND": "cpu", "MINIMAX_SP_LOGDIR": tmp,
+                   "MINIMAX_SP_STARTUP_TIMEOUT": "240", "MINIMAX_SP_COLLECTIVE_TIMEOUT": "120"}
+            paths = folder_paths.folder_names_and_paths["diffusion_models"][0]
+            paths.append(tmp)
+            torch.manual_seed(3)
+            x = [torch.randn(1, 24, 2, 4, 4), torch.randn(1, 32, 2, 3)]
+            timestep, context = torch.tensor([500.0]), torch.randn(1, 3, 64)
+
+            def run(model):
+                group = sp_group.active_group()
+                model.pre_run()
+                dit = model.get_model_object("diffusion_model")
+                with torch.no_grad():
+                    expected = type(dit)._forward(dit, x, timestep, context, transformer_options={})
+                    got = group.forward(dit, x, timestep, context, {}, None)
+                for actual, reference in zip(got, expected):
+                    torch.testing.assert_close(actual, reference, atol=1e-5, rtol=1e-4)
+                model.cleanup()
+                return group, got
+
+            try:
+                with patch.dict(os.environ, env):
+                    first = node.MiniMaxH3SPUNETLoader.execute("tiny_a.safetensors", "default", 2, "auto").result[0]
+                    group_a, out_a = run(first)
+                    procs_a = list(group_a.procs)
+
+                    second = node.MiniMaxH3SPUNETLoader.execute("tiny_b.safetensors", "default", 2, "auto").result[0]
+                    group_b = sp_group.active_group()
+                    self.assertIsNot(group_b, group_a)
+                    self.assertEqual(group_b.unet_name, "tiny_b.safetensors")
+                    self.assertEqual([p.returncode for p in procs_a], [0])
+                    self.assertEqual(len(sp_group._GROUPS), 1)
+                    _, out_b = run(second)
+                    self.assertFalse(torch.allclose(out_a[0], out_b[0]))
+                    sp_group.active_group().shutdown()
+                    self.assertIsNone(sp_group.active_group())
             except Exception:
                 log = os.path.join(tmp, "minimax_sp_worker1.log")
                 if os.path.exists(log):
