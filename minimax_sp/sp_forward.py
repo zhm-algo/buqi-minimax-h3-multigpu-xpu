@@ -110,15 +110,10 @@ def a2a_gather_seq_scatter_heads(t, ctx):
     p = ctx.world
     hp = heads // p
     chunk = hp * dim
-    send = t.reshape(s_local, p, chunk).transpose(0, 1).contiguous().view(-1)
-    out = torch.empty(ctx.seq_len * chunk, dtype=t.dtype, device=t.device)
-    spdev.run_collective(dist.all_to_all_single,
-        out, send,
-        output_split_sizes=[n * chunk for n in ctx.splits],
-        input_split_sizes=[s_local * chunk] * p,
-        group=ctx.group,
-        timeout=ctx.timeout,
-    )
+    send = t.reshape(s_local, p, chunk).transpose(0, 1)
+    out = torch.empty(ctx.seq_len, chunk, dtype=t.dtype, device=t.device)
+    spdev.all_to_all_rows(out, send, ctx.splits, [s_local] * p, ctx.group,
+                          timeout=ctx.timeout, max_rows=p * max(ctx.splits))
     return out.view(ctx.seq_len, hp, dim)
 
 
@@ -127,15 +122,10 @@ def a2a_scatter_seq_gather_heads(t, ctx):
     chunk = t.shape[1]
     p = ctx.world
     s_local = ctx.local
-    out = torch.empty(p * s_local * chunk, dtype=t.dtype, device=t.device)
-    spdev.run_collective(dist.all_to_all_single,
-        out, t.contiguous().view(-1),
-        output_split_sizes=[s_local * chunk] * p,
-        input_split_sizes=[n * chunk for n in ctx.splits],
-        group=ctx.group,
-        timeout=ctx.timeout,
-    )
-    return out.view(p, s_local, chunk).transpose(0, 1).reshape(s_local, p * chunk)
+    out = torch.empty(s_local, p, chunk, dtype=t.dtype, device=t.device)
+    spdev.all_to_all_rows(out.transpose(0, 1), t, [s_local] * p, ctx.splits, ctx.group,
+                          timeout=ctx.timeout, max_rows=p * max(ctx.splits))
+    return out.view(s_local, p * chunk)
 
 
 def run_optimized_attention(attn, q, k, v, heads, transformer_options):
@@ -233,8 +223,7 @@ def _gather_rows(local, counts, ctx, out_dim, device):
     if local is not None:
         buf[:local.shape[0]] = local
     gathered = torch.empty(ctx.world * maxn, out_dim, dtype=torch.float32, device=buf.device)
-    spdev.run_collective(spdev.all_gather_single_op(), gathered, buf, group=ctx.group,
-                         timeout=getattr(ctx, "timeout", None))
+    spdev.all_gather_rows(gathered, buf, ctx.group, timeout=getattr(ctx, "timeout", None))
     gathered = gathered.view(ctx.world, maxn, out_dim)
     return torch.cat([gathered[r, :counts[r]] for r in range(ctx.world) if counts[r] > 0], dim=0)
 

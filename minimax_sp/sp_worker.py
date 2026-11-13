@@ -110,7 +110,8 @@ def worker_forward(meta, previous_operation_id, rank, world, device, control_pg,
                    *tensors["cond_video"], *tensors["cond_audio"], tensors["sample_sigmas"],
                    denoise_mask, audio_denoise_mask]:
         if tensor is not None:
-            dist.broadcast(tensor, src=0, group=tensor_pg)
+            # Same device module as sp_forward, so both share one staging buffer.
+            spg.spdev.broadcast_tensor(tensor, 0, tensor_pg)
 
     payload = spg.payload_from_meta(meta, tensors)
     options = dict(meta["options"])

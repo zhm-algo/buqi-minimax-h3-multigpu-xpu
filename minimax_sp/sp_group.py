@@ -41,6 +41,23 @@ TO_WORKER_OPTIONS = ("minimax_h3_sigma_shift_video", "minimax_h3_sigma_shift_aud
 _GROUPS = {}
 
 
+def device_usage_summary(device):
+    """Describe physical device use next to what DynamicVRAM tracks, for OOM diagnosis."""
+    used = spdev.device_memory_used(device)
+    if used is None:
+        return ""
+    summary = f"; device used {used / 2**20:.0f} MiB"
+    if getattr(comfy.memory_management, "aimdo_enabled", False):
+        try:
+            import comfy_aimdo.control
+            tracked = comfy_aimdo.control.get_total_vram_usage()
+            summary += (f", DynamicVRAM tracked {tracked / 2**20:.0f} MiB, "
+                        f"untracked {(used - tracked) / 2**20:.0f} MiB")
+        except Exception:
+            pass
+    return summary
+
+
 def positive_timeout(name, default):
     value = os.environ.get(name, str(default))
     try:
@@ -404,7 +421,7 @@ class SPGroup:
                 transformer_options["sample_sigmas"] = transformer_options["sample_sigmas"].to(device)
             for t in [*ordered_tensors(x, timestep, context, transformer_options, payload), denoise_mask, audio_denoise_mask]:
                 if t is not None:
-                    dist.broadcast(t.to(device).contiguous(), src=0, group=self.tensor_pg)
+                    spdev.broadcast_tensor(t.to(device).contiguous(), 0, self.tensor_pg)
             if profile:
                 spdev.synchronize(device)
             t0 = time.perf_counter()
@@ -471,9 +488,9 @@ class SPGroup:
         comfy.model_management.soft_empty_cache()
         after = spdev.memory_reserved(device)
         logging.info("[minimax_sp] rank 0 released %.0f MiB of cached sampler memory "
-                     "(reserved %.0f -> %.0f MiB, allocated %.0f MiB)",
+                     "(reserved %.0f -> %.0f MiB, allocated %.0f MiB)%s",
                      (before - after) / 2**20, before / 2**20, after / 2**20,
-                     spdev.memory_allocated(device) / 2**20)
+                     spdev.memory_allocated(device) / 2**20, device_usage_summary(device))
 
     def destroy(self):
         # Do not broadcast shutdown into a failed collective.

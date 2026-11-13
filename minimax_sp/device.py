@@ -273,6 +273,21 @@ def memory_reserved(device):
     return 0
 
 
+def device_memory_used(device):
+    """Physical memory in use on the device by all processes, or None if unknown."""
+    device = torch.device(device)
+    try:
+        if device.type == "cuda":
+            free, total = torch.cuda.mem_get_info(device)
+        elif device.type == "xpu":
+            free, total = torch.xpu.mem_get_info(device)
+        else:
+            return None
+    except Exception:
+        return None
+    return total - free
+
+
 def synchronize(device=None):
     """Wait for the accelerator (the given device, or the current CUDA/XPU device)."""
     if device is not None:
@@ -404,3 +419,131 @@ def run_collective(op, *args, timeout=None, **kwargs):
 def all_gather_single_op():
     # all_gather_single is new in PyTorch 2.13; older XPU stacks only ship the legacy name.
     return getattr(dist, "all_gather_single", None) or dist.all_gather_into_tensor
+
+
+# On Arc Pro B70 (PyTorch 2.14 XCCL/oneCCL) device memory that has ever been a
+# collective buffer is not returned to the device when PyTorch frees it, not even by
+# destroy_process_group; only process exit releases it. Fresh activation buffers
+# therefore leak a little more every prompt until DynamicVRAM can no longer fault in
+# weights. XPU collectives are staged through one fixed per-process buffer instead.
+DEFAULT_XPU_COMM_BUFFER_MB = 512
+_COMM_BUFFERS = {}
+
+
+def comm_buffer_bytes(device):
+    """Size of the fixed collective staging buffer for this device; 0 disables staging."""
+    device = torch.device(device)
+    value = os.environ.get("MINIMAX_SP_COMM_BUFFER_MB")
+    if value is None or not value.strip():
+        megabytes = DEFAULT_XPU_COMM_BUFFER_MB if device.type == "xpu" else 0
+    else:
+        try:
+            megabytes = float(value)
+        except ValueError:
+            raise ValueError(f"MINIMAX_SP_COMM_BUFFER_MB must be a number, got {value!r}") from None
+        if megabytes < 0:
+            raise ValueError("MINIMAX_SP_COMM_BUFFER_MB must not be negative")
+    return int(megabytes * 2**20) // 512 * 512
+
+
+def comm_slots(device, dtype):
+    """Two equal (send, receive) staging views of `dtype`, or None when staging is off.
+
+    Every rank derives the size from the same environment, so chunking stays identical.
+    """
+    device = torch.device(device)
+    total = comm_buffer_bytes(device)
+    if not total:
+        return None
+    if device.type == "xpu" and device.index is None:
+        device = torch.device("xpu", torch.xpu.current_device())
+    key = (device.type, device.index)
+    buf = _COMM_BUFFERS.get(key)
+    if buf is None or buf.numel() != total:
+        buf = _COMM_BUFFERS[key] = torch.empty(total, dtype=torch.uint8, device=device)
+    half = total // 2 // 256 * 256
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    if half < itemsize:
+        return None
+    return buf[:half].view(dtype), buf[half:2 * half].view(dtype)
+
+
+def _column_chunks(columns, rows, slot_numel):
+    width = max(1, min(columns, slot_numel // max(rows, 1)))
+    if width * max(rows, 1) > slot_numel:
+        raise RuntimeError(f"MINIMAX_SP_COMM_BUFFER_MB is too small for {rows} rows; increase it")
+    for start in range(0, columns, width):
+        yield start, min(start + width, columns)
+
+
+def all_to_all_rows(out, send, out_splits, in_splits, group, timeout=None, max_rows=None):
+    """all_to_all_single along rows of [..., C] tensors; leading dims flatten to rows.
+
+    Split sizes count rows. `max_rows` must be identical on every rank (it fixes the
+    column chunking when staging); `out` and `send` may be non-contiguous views.
+    """
+    columns = send.shape[-1]
+    rows_in, rows_out = send.numel() // max(columns, 1), out.numel() // max(columns, 1)
+    slots = comm_slots(send.device, send.dtype)
+    if slots is None:
+        source = send.reshape(rows_in, columns)
+        direct = out.is_contiguous()
+        target = out.view(rows_out, columns) if direct else torch.empty(
+            (rows_out, columns), dtype=out.dtype, device=out.device)
+        run_collective(dist.all_to_all_single, target, source.contiguous(),
+                       output_split_sizes=list(out_splits), input_split_sizes=list(in_splits),
+                       group=group, timeout=timeout)
+        if not direct:
+            out.copy_(target.view(out.shape))
+        return out
+    send_slot, recv_slot = slots
+    rows = max(max_rows or 0, rows_in, rows_out)
+    for start, stop in _column_chunks(columns, rows, send_slot.numel()):
+        width = stop - start
+        staged_send = send_slot[:rows_in * width].view(*send.shape[:-1], width)
+        staged_send.copy_(send[..., start:stop])
+        staged_recv = recv_slot[:rows_out * width].view(rows_out, width)
+        run_collective(dist.all_to_all_single, staged_recv, staged_send.view(rows_in, width),
+                       output_split_sizes=list(out_splits), input_split_sizes=list(in_splits),
+                       group=group, timeout=timeout)
+        out[..., start:stop].copy_(staged_recv.view(*out.shape[:-1], width))
+    return out
+
+
+def all_gather_rows(out, send, group, timeout=None):
+    """all_gather_into_tensor of [rows, C] blocks into [world * rows, C]."""
+    columns = send.shape[-1]
+    slots = comm_slots(send.device, send.dtype)
+    if slots is None:
+        run_collective(all_gather_single_op(), out, send.contiguous(), group=group, timeout=timeout)
+        return out
+    send_slot, recv_slot = slots
+    rows_in, rows_out = send.numel() // max(columns, 1), out.numel() // max(columns, 1)
+    for start, stop in _column_chunks(columns, rows_out, send_slot.numel()):
+        width = stop - start
+        staged_send = send_slot[:rows_in * width].view(rows_in, width)
+        staged_send.copy_(send.reshape(rows_in, columns)[:, start:stop])
+        staged_recv = recv_slot[:rows_out * width].view(rows_out, width)
+        run_collective(all_gather_single_op(), staged_recv, staged_send, group=group, timeout=timeout)
+        out.view(rows_out, columns)[:, start:stop].copy_(staged_recv)
+    return out
+
+
+def broadcast_tensor(tensor, src, group, timeout=None):
+    """In-place broadcast of a contiguous tensor, staged in fixed-size pieces on XPU."""
+    slots = comm_slots(tensor.device, tensor.dtype)
+    if slots is None:
+        run_collective(dist.broadcast, tensor, src=src, group=group, timeout=timeout)
+        return tensor
+    slot = slots[0]
+    flat = tensor.view(-1)
+    is_source = dist.get_rank(group) == src
+    for start in range(0, flat.numel(), slot.numel()):
+        stop = min(start + slot.numel(), flat.numel())
+        staged = slot[:stop - start]
+        if is_source:
+            staged.copy_(flat[start:stop])
+        run_collective(dist.broadcast, staged, src=src, group=group, timeout=timeout)
+        if not is_source:
+            flat[start:stop].copy_(staged)
+    return tensor

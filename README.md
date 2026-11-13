@@ -195,6 +195,7 @@ The parity and lifecycle scripts exit nonzero on failure. `tests/selftest.py` is
 | `MINIMAX_SP_XPU_VISIBILITY` | `shared` | Intel XPU worker visibility: `shared` or `isolated` |
 | `MINIMAX_SP_STARTUP_TIMEOUT` | 300 s | Worker/process-group startup timeout |
 | `MINIMAX_SP_COLLECTIVE_TIMEOUT` | 120 s | NCCL collective timeout; on Intel XPU, each probe/all-to-all/final gather wait and host enqueue stall warning |
+| `MINIMAX_SP_COMM_BUFFER_MB` | 512 on XPU, else 0 | Fixed per-process collective staging buffer on Intel XPU (MiB). On B70, device memory once handed to XCCL is not returned after PyTorch frees it, so every exchange is chunked through this buffer; `0` disables it (prompts may then fail with `Fault failed: 2` after a few runs) |
 | `MINIMAX_SP_LOGDIR` | system temp directory | Worker log directory (`minimax_sp_worker<N>.log`) |
 | `MINIMAX_SP_VERIFY=1` | off | Compare the first SP result with native H3 before accepting it |
 | `MINIMAX_SP_PROFILE=1` | off | Forward timing logs |

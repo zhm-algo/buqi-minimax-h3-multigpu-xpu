@@ -189,6 +189,7 @@ COMFYUI_ROOT=/path/to/ComfyUI python tests/runtime_recovery.py \
 | `MINIMAX_SP_XPU_VISIBILITY` | `shared` | Intel XPU worker 可见性：`shared` 或 `isolated` |
 | `MINIMAX_SP_STARTUP_TIMEOUT` | 300 秒 | worker/进程组启动超时 |
 | `MINIMAX_SP_COLLECTIVE_TIMEOUT` | 120 秒 | NCCL collective 超时；Intel XPU 上每次 probe/all-to-all/最终 gather 的等待上限及主机入队停滞告警 |
+| `MINIMAX_SP_COMM_BUFFER_MB` | XPU 512，其他 0 | Intel XPU 固定通信暂存缓冲区（MiB，每进程一份）。B70 上曾交给 XCCL 的显存在 PyTorch 释放后不会归还，因此所有交换都经此缓冲区分块传输；设为 `0` 可关闭（多次 prompt 后可能出现 `Fault failed: 2`） |
 | `MINIMAX_SP_LOGDIR` | 系统临时目录 | `minimax_sp_worker<N>.log` 所在目录 |
 | `MINIMAX_SP_VERIFY=1` | 关闭 | 首次 SP 输出与原生 H3 对比后才接受 |
 | `MINIMAX_SP_PROFILE=1` | 关闭 | forward 耗时 |

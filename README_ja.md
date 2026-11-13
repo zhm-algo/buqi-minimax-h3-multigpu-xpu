@@ -113,6 +113,7 @@ GPU tensor parity と実際の loader/SPGroup lifecycle command は [English REA
 - `MINIMAX_SP_XPU_VISIBILITY=shared`: Intel XPU worker の可視性（`shared` / `isolated`）。
 - `MINIMAX_SP_STARTUP_TIMEOUT=300`: startup timeout（秒）。
 - `MINIMAX_SP_COLLECTIVE_TIMEOUT=120`: collective timeout（秒）。Intel XPU では各 probe/all-to-all/最終 gather の待機上限とホスト enqueue 停滞警告。
+- `MINIMAX_SP_COMM_BUFFER_MB=512`: Intel XPU の固定 collective staging buffer（MiB、プロセスごと）。B70 では一度 XCCL に渡したデバイスメモリが解放されないため、すべての交換をこの buffer 経由で分割転送します。`0` で無効化（数 prompt 後に `Fault failed: 2` が出る可能性あり）。
 - `MINIMAX_SP_LOGDIR=/path`: `minimax_sp_worker<N>.log` の保存先。
 
 ノードが出ない場合は clone 先と root `__init__.py`、ComfyUI 起動ログを確認してください。P2P/startup/collective failure は `nvidia-smi`、device mapping、NCCL と各 worker log を確認します。Intel XPU の XCCL probe が失敗する場合は `sycl-ls` と `ZE_AFFINITY_MASK`/`MINIMAX_SP_DEVICES` を照合し、`MINIMAX_SP_XPU_VISIBILITY=shared`、ACS/IOMMU による PCIe P2P のブロック、`CCL_LOG_LEVEL=info` のログを確認してください。旧 VAE node の deprecated warning が出たら標準 `VAEDecode` に置き換えてください。checkpoint/dtype/world size を変える場合は ComfyUI を再起動してください。

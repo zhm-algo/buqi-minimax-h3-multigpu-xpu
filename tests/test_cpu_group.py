@@ -44,10 +44,18 @@ class CPUGroupLifecycleTests(unittest.TestCase):
             self.skipTest(f"TCPStore unavailable: {exc}")
 
     def test_loader_spawns_worker_runs_forward_and_shuts_down(self):
+        self._run_lifecycle({})
+
+    def test_staged_collectives_match_native_forward_across_ranks(self):
+        # A tiny staging buffer forces every rank through many identical collective chunks.
+        self._run_lifecycle({"MINIMAX_SP_COMM_BUFFER_MB": "0.002"})
+
+    def _run_lifecycle(self, extra_env):
         with tempfile.TemporaryDirectory() as tmp:
             save_tiny_h3(os.path.join(tmp, "tiny_h3.safetensors"))
             env = {"MINIMAX_SP_BACKEND": "cpu", "MINIMAX_SP_LOGDIR": tmp,
-                   "MINIMAX_SP_STARTUP_TIMEOUT": "240", "MINIMAX_SP_COLLECTIVE_TIMEOUT": "120"}
+                   "MINIMAX_SP_STARTUP_TIMEOUT": "240", "MINIMAX_SP_COLLECTIVE_TIMEOUT": "120",
+                   **extra_env}
             paths = folder_paths.folder_names_and_paths["diffusion_models"][0]
             paths.append(tmp)
             group = None

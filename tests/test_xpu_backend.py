@@ -370,7 +370,7 @@ class BoundedCollectiveTests(unittest.TestCase):
         def exchange(out, source, **kwargs):
             self.assertTrue(kwargs["async_op"])
             self.assertEqual(kwargs["group"], "tensor-group")
-            out.copy_(torch.arange(out.numel(), dtype=out.dtype))
+            out.copy_(torch.arange(out.numel(), dtype=out.dtype).view_as(out))
             work = Mock()
             works.append(work)
             return work
@@ -418,6 +418,53 @@ class BoundedCollectiveTests(unittest.TestCase):
             finally:
                 torch.distributed.destroy_process_group()
                 del store
+
+    def test_staged_collectives_chunk_through_one_reused_buffer(self):
+        # 0.002 MiB -> 1 KiB staging slots, so every exchange below needs several chunks.
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {"MINIMAX_SP_COMM_BUFFER_MB": "0.002"}):
+            store = torch.distributed.FileStore(os.path.join(tmp, "store"), 1)
+            torch.distributed.init_process_group("gloo", store=store, rank=0, world_size=1)
+            spdev._COMM_BUFFERS.clear()
+            sources = []
+            real = torch.distributed.all_to_all_single
+
+            def record(out, source, **kwargs):
+                sources.append(source.data_ptr())
+                return real(out, source, **kwargs)
+
+            try:
+                ctx = spf.SPContext(0, 1, None, 5, timeout=timedelta(seconds=30))
+                q = torch.randn(5, 4, 32)
+                with patch.object(spdev.dist, "all_to_all_single", side_effect=record):
+                    gathered = spf.a2a_gather_seq_scatter_heads(q, ctx)
+                    restored = spf.a2a_scatter_seq_gather_heads(gathered.reshape(5, 128), ctx)
+                torch.testing.assert_close(gathered, q)
+                torch.testing.assert_close(restored, q.reshape(5, 128))
+                self.assertGreater(len(sources), 2)
+                buffer = spdev._COMM_BUFFERS[("cpu", None)]
+                self.assertEqual(set(sources), {buffer.data_ptr()})
+
+                rows = torch.randn(7, 50)
+                torch.testing.assert_close(spf._gather_rows(rows, [7], ctx, 50, "cpu"), rows)
+                values = torch.arange(1000, dtype=torch.int64)
+                torch.testing.assert_close(spdev.broadcast_tensor(values.clone(), 0, None), values)
+                self.assertIs(spdev._COMM_BUFFERS[("cpu", None)], buffer)
+            finally:
+                spdev._COMM_BUFFERS.clear()
+                torch.distributed.destroy_process_group()
+                del store
+
+    def test_comm_buffer_defaults_to_xpu_only(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(spdev.comm_buffer_bytes("xpu:0"), spdev.DEFAULT_XPU_COMM_BUFFER_MB * 2**20)
+            self.assertEqual(spdev.comm_buffer_bytes("cuda:0"), 0)
+            self.assertIsNone(spdev.comm_slots("cpu", torch.float32))
+        with patch.dict(os.environ, {"MINIMAX_SP_COMM_BUFFER_MB": "0"}):
+            self.assertEqual(spdev.comm_buffer_bytes("xpu:0"), 0)
+        with patch.dict(os.environ, {"MINIMAX_SP_COMM_BUFFER_MB": "-1"}), \
+                self.assertRaisesRegex(ValueError, "negative"):
+            spdev.comm_buffer_bytes("xpu:0")
 
     def test_startup_probe_bounds_both_checks(self):
         tensor_pg, timeout = object(), timedelta(seconds=9)
