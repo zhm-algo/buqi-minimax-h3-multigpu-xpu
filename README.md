@@ -150,17 +150,14 @@ The manual GPU acceptance workflow runs the same steps with `backend=xpu` on a s
 
 | File | Format | Coverage |
 |---|---|---|
-| [`examples/workflow_ui_2gpu.json`](examples/workflow_ui_2gpu.json) | UI | Direct copy of the checked-out official “Image to Video (MiniMax H3)” blueprint with only `UNETLoader` replaced by `MiniMaxH3SPUNETLoader`; optional first/last inputs cover T2V, first-frame I2V, first+last I2V, and its static Turbo LoRA switch |
-| [`examples/workflow_api_t2v_2gpu.json`](examples/workflow_api_t2v_2gpu.json) | API | T2V |
-| [`examples/workflow_api_2gpu.json`](examples/workflow_api_2gpu.json) | API | First-frame I2V |
-| [`examples/workflow_api_i2v_first_last_2gpu.json`](examples/workflow_api_i2v_first_last_2gpu.json) | API | First+last-frame I2V |
-| [`examples/workflow_api_r2v_2gpu.json`](examples/workflow_api_r2v_2gpu.json) | API | R2V reference image |
-| [`examples/workflow_api_addguide_2gpu.json`](examples/workflow_api_addguide_2gpu.json) | API | Arbitrary-frame AddGuide |
-| [`examples/workflow_api_turbo_lora_2gpu.json`](examples/workflow_api_turbo_lora_2gpu.json) | API | Static 8-step Turbo LoRA |
+| [`examples/workflow_api_t2v_2gpu.json`](examples/workflow_api_t2v_2gpu.json) | UI | T2V |
+| [`examples/workflow_api_i2v_2gpu.json`](examples/workflow_api_i2v_2gpu.json) | UI | First-frame I2V |
+| [`examples/workflow_api_i2v_first_last_2gpu.json`](examples/workflow_api_i2v_first_last_2gpu.json) | UI | First+last-frame I2V |
+| [`examples/workflow_api_r2v_2gpu.json`](examples/workflow_api_r2v_2gpu.json) | UI | R2V with two reference images |
 
-The API variants follow the node schemas in the tested development commit but are not claimed as upstream-exported templates. For a deployment-specific API graph, import the UI workflow, configure and validate it with your installed models, enable ComfyUI Developer Mode, then use **Save (API Format)**.
+All examples are ComfyUI UI graphs (load them by dragging into ComfyUI or via **Open**) that use `MiniMaxH3SPUNETLoader` with `world_size=2` and `devices=auto`, and were validated on two Intel Arc Pro B70 cards. For an API graph, open the workflow, enable ComfyUI Developer Mode, then use **Save (API Format)**.
 
-API image names beginning with `REPLACE_WITH_` are intentional placeholders. Put your own files in `ComfyUI/input` and replace those values before submission. The UI workflow has no repository image dependency.
+The `LoadImage` nodes name images from the validation setup that are not shipped with this repository. Put your own files in `ComfyUI/input` and select them before running.
 
 ## Verification
 

@@ -90,10 +90,9 @@ SP の collective をビット単位で検証し、ランダムな小型 H3 を 
 
 ## サンプル
 
-- [`examples/workflow_ui_2gpu.json`](examples/workflow_ui_2gpu.json): 固定 commit の公式 MiniMax H3 UI blueprint をコピーし、`UNETLoader` のみ SP loader に変更。T2V / first / first+last / Turbo を設定できます。
-- API: [`T2V`](examples/workflow_api_t2v_2gpu.json), [`I2V first`](examples/workflow_api_2gpu.json), [`I2V first+last`](examples/workflow_api_i2v_first_last_2gpu.json), [`R2V`](examples/workflow_api_r2v_2gpu.json), [`AddGuide`](examples/workflow_api_addguide_2gpu.json), [`Turbo LoRA`](examples/workflow_api_turbo_lora_2gpu.json)。
+- UI workflow: [`T2V`](examples/workflow_api_t2v_2gpu.json), [`I2V first`](examples/workflow_api_i2v_2gpu.json), [`I2V first+last`](examples/workflow_api_i2v_first_last_2gpu.json), [`R2V`（参照画像 2 枚）](examples/workflow_api_r2v_2gpu.json)。
 
-API の `REPLACE_WITH_...` は `ComfyUI/input` 内の自分の画像名へ変更してください。API variant は現在の node schema に合わせた例で、upstream 公式 export を装ってはいません。実環境では UI workflow を確認後、Developer Mode の **Save (API Format)** で再 export してください。
+いずれも ComfyUI の UI workflow で、`MiniMaxH3SPUNETLoader`（`world_size=2`、`devices=auto`）を使い、Intel Arc Pro B70 2 枚で検証済みです。API 形式が必要な場合は workflow を開き、Developer Mode の **Save (API Format)** で export してください。`LoadImage` の画像名は検証環境のもので、リポジトリには含まれません。`ComfyUI/input` に自分の画像を置き、実行前に選び直してください。
 
 ## 検証とトラブルシューティング
 
