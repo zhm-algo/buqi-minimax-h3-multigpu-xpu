@@ -38,6 +38,20 @@ class PatchManifest:
                 "sha256": self.sha256, "keys": list(self.keys)}
 
 
+def patch_safe_globals():
+    """ComfyUI weight adapter classes that LoRA-style patches are stored as."""
+    try:
+        import comfy.weight_adapter
+    except ImportError:
+        return []
+    return list(getattr(comfy.weight_adapter, "adapters", ()))
+
+
+def load_patches(stream):
+    with torch.serialization.safe_globals(patch_safe_globals()):
+        return torch.load(stream, map_location="cpu", weights_only=True)
+
+
 def validate_replies(manifest, replies, world):
     if len(replies) != world or any(reply != manifest.ready(rank) for rank, reply in enumerate(replies)):
         raise RuntimeError(f"MiniMax SP patch synchronization failed; denoise prohibited: {replies}")
@@ -128,7 +142,7 @@ class WorkerPatches:
                 if digest != manifest.sha256:
                     raise RuntimeError("patch file digest mismatch")
                 stream.seek(0)
-                patches = torch.load(stream, map_location="cpu", weights_only=True)
+                patches = load_patches(stream)
         if tuple(sorted(patches)) != manifest.keys:
             raise RuntimeError("patch manifest keys mismatch")
         patcher.unpatch_model(patcher.offload_device)

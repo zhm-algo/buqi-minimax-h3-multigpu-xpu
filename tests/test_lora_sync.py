@@ -97,6 +97,29 @@ class PatchSyncTests(unittest.TestCase):
                     self.assertFalse(path.exists())
         self.assertEqual(child.unpatch_model.call_count, 3)
 
+    def test_weight_adapter_patches_load_in_worker(self):
+        from comfy.weight_adapter.lora import LoRAAdapter
+        parent, child = fake_patcher(), fake_patcher()
+        adapter = LoRAAdapter({"w.lora_up.weight", "w.lora_down.weight"},
+                              (torch.ones(4, 2), torch.ones(2, 4), 8.0, None, None, None))
+        parent.patches = {"weight": [(1.0, adapter, 1.0, None, None)]}
+        worker = sync.WorkerPatches(child, 1)
+
+        def load(models, **kwargs):
+            for p in models:
+                p.model.current_weight_patches_uuid = p.patches_uuid
+
+        with patch.object(sync.comfy.model_management, "load_models_gpu", side_effect=load):
+            worker.prepare(0, parent.patches_uuid)
+            with sync.export_patches(parent) as manifest:
+                reply = worker.apply(sync.PatchManifest.from_message(manifest.message()))
+        self.assertEqual(reply, manifest.ready(1))
+        loaded = child.patches["weight"][0][1]
+        self.assertIsInstance(loaded, LoRAAdapter)
+        self.assertEqual(loaded.loaded_keys, adapter.loaded_keys)
+        self.assertTrue(torch.equal(loaded.weights[0], adapter.weights[0]))
+        self.assertEqual(loaded.weights[2], 8.0)
+
     def test_bad_hash_and_keys_cannot_load(self):
         worker = sync.WorkerPatches(fake_patcher(), 1)
         with sync.export_patches(fake_patcher()) as manifest:
