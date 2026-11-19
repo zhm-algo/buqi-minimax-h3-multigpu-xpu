@@ -154,6 +154,9 @@ The manual GPU acceptance workflow runs the same steps with `backend=xpu` on a s
 | [`examples/workflow_api_i2v_2gpu.json`](examples/workflow_api_i2v_2gpu.json) | UI | First-frame I2V |
 | [`examples/workflow_api_i2v_first_last_2gpu.json`](examples/workflow_api_i2v_first_last_2gpu.json) | UI | First+last-frame I2V |
 | [`examples/workflow_api_r2v_2gpu.json`](examples/workflow_api_r2v_2gpu.json) | UI | R2V with two reference images |
+| [`examples/workflow_api_t2v_turbo_lora_2gpu.json`](examples/workflow_api_t2v_turbo_lora_2gpu.json) | UI | T2V with the static 8-step Turbo LoRA |
+| [`examples/workflow_api_i2v_turbo_lora_2gpu.json`](examples/workflow_api_i2v_turbo_lora_2gpu.json) | UI | First-frame I2V with the static 8-step Turbo LoRA |
+| [`examples/workflow_api_i2v_first_last_turbo_lora_2gpu.json`](examples/workflow_api_i2v_first_last_turbo_lora_2gpu.json) | UI | First+last-frame I2V with the static 8-step Turbo LoRA |
 
 All examples are ComfyUI UI graphs (load them by dragging into ComfyUI or via **Open**) that use `MiniMaxH3SPUNETLoader` with `world_size=2` and `devices=auto`, and were validated on two Intel Arc Pro B70 cards. For an API graph, open the workflow, enable ComfyUI Developer Mode, then use **Save (API Format)**.
 

@@ -148,6 +148,9 @@ COMFYUI_ROOT=/path/to/ComfyUI torchrun --standalone --nproc-per-node=2 \
 | [`examples/workflow_api_i2v_2gpu.json`](examples/workflow_api_i2v_2gpu.json) | UI：I2V first |
 | [`examples/workflow_api_i2v_first_last_2gpu.json`](examples/workflow_api_i2v_first_last_2gpu.json) | UI：I2V first+last |
 | [`examples/workflow_api_r2v_2gpu.json`](examples/workflow_api_r2v_2gpu.json) | UI：R2V（两张参考图） |
+| [`examples/workflow_api_t2v_turbo_lora_2gpu.json`](examples/workflow_api_t2v_turbo_lora_2gpu.json) | UI：T2V + 静态 8-step Turbo LoRA |
+| [`examples/workflow_api_i2v_turbo_lora_2gpu.json`](examples/workflow_api_i2v_turbo_lora_2gpu.json) | UI：I2V first + 静态 8-step Turbo LoRA |
+| [`examples/workflow_api_i2v_first_last_turbo_lora_2gpu.json`](examples/workflow_api_i2v_first_last_turbo_lora_2gpu.json) | UI：I2V first+last + 静态 8-step Turbo LoRA |
 
 所有示例都是 ComfyUI UI 工作流（拖入 ComfyUI 或通过 **Open** 打开），使用 `MiniMaxH3SPUNETLoader`，`world_size=2`、`devices=auto`，已在两张 Intel Arc Pro B70 上验证。需要 API 格式时，打开工作流后启用 ComfyUI Developer Mode，再使用 **Save (API Format)** 导出。
 
