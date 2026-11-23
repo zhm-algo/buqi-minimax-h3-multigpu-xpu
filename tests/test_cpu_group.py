@@ -50,6 +50,20 @@ class CPUGroupLifecycleTests(unittest.TestCase):
         # A tiny staging buffer forces every rank through many identical collective chunks.
         self._run_lifecycle({"MINIMAX_SP_COMM_BUFFER_MB": "0.002"})
 
+    def test_staged_uneven_splits_are_padded_to_even_exchanges(self):
+        # The tiny forward has 17 rows, split 9/8; XCCL's uneven all-to-all is up to ~6x slower on B70.
+        splits = set()
+        real = torch.distributed.all_to_all_single
+
+        def record(out, source, **kwargs):
+            if "output_split_sizes" in kwargs:  # the startup probe exchanges without split lists
+                splits.update((tuple(kwargs["output_split_sizes"]), tuple(kwargs["input_split_sizes"])))
+            return real(out, source, **kwargs)
+
+        with patch.object(spdev.dist, "all_to_all_single", side_effect=record):
+            self._run_lifecycle({"MINIMAX_SP_COMM_BUFFER_MB": "0.002"})
+        self.assertEqual(splits, {(9, 9)})
+
     def _run_lifecycle(self, extra_env):
         with tempfile.TemporaryDirectory() as tmp:
             save_tiny_h3(os.path.join(tmp, "tiny_h3.safetensors"))

@@ -348,19 +348,25 @@ class BoundedCollectiveTests(unittest.TestCase):
         self.assertEqual(spdev.run_collective(op, 1, group="g"), "done")
         op.assert_called_once_with(1, group="g")
 
-    def test_bounded_collective_waits_with_timeout(self):
+    def test_bounded_collective_polls_until_complete(self):
         work = Mock()
+        work.is_completed.side_effect = [False, False, True]
         op = Mock(return_value=work)
-        timeout = timedelta(seconds=7)
-        spdev.run_collective(op, 1, group="g", timeout=timeout)
+        with patch.object(spdev.time, "sleep") as sleep:
+            spdev.run_collective(op, 1, group="g", timeout=timedelta(seconds=7))
         op.assert_called_once_with(1, async_op=True, group="g")
-        work.wait.assert_called_once_with(timeout)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertLess(max(c.args[0] for c in sleep.call_args_list), 0.001)
+        # Once complete, only the stream dependency is added: XCCL's wait(timeout) sleeps 10 ms per check.
+        work.wait.assert_called_once_with()
 
     def test_bounded_wait_error_surfaces(self):
         work = Mock()
+        work.is_completed.return_value = False
         work.wait.side_effect = RuntimeError("Work timed out after 7000 milliseconds.")
         with self.assertRaisesRegex(RuntimeError, "timed out"):
-            spdev.run_collective(Mock(return_value=work), timeout=timedelta(seconds=7))
+            spdev.run_collective(Mock(return_value=work), timeout=timedelta(0))
+        work.wait.assert_called_once_with(timedelta(0))
 
     def test_all_to_all_bounds_both_directions_without_changing_shapes(self):
         timeout = timedelta(seconds=7)
@@ -375,14 +381,14 @@ class BoundedCollectiveTests(unittest.TestCase):
             works.append(work)
             return work
 
-        with patch.object(spf.dist, "all_to_all_single", side_effect=exchange):
+        with patch.object(spf.dist, "all_to_all_single", side_effect=exchange), \
+                patch.object(spdev, "wait_work") as wait:
             gathered = spf.a2a_gather_seq_scatter_heads(torch.zeros(2, 4, 3), ctx)
             restored = spf.a2a_scatter_seq_gather_heads(gathered.reshape(4, 6), ctx)
         self.assertEqual(gathered.shape, (4, 2, 3))
         self.assertEqual(restored.shape, (2, 12))
         self.assertEqual(len(works), 2)
-        for work in works:
-            work.wait.assert_called_once_with(timeout)
+        self.assertEqual(wait.call_args_list, [call(work, timeout) for work in works])
 
     def test_attention_releases_full_sequence_qkv_before_output_exchange(self):
         gathered_refs = []
@@ -487,11 +493,11 @@ class BoundedCollectiveTests(unittest.TestCase):
             return make_work()
 
         with patch.object(spg.dist, "all_reduce", side_effect=all_reduce), \
-                patch.object(spg.dist, "all_to_all_single", side_effect=all_to_all):
+                patch.object(spg.dist, "all_to_all_single", side_effect=all_to_all), \
+                patch.object(spdev, "wait_work") as wait:
             spg.startup_probe(0, 2, tensor_pg, "cpu", timeout)
         self.assertEqual(len(works), 2)
-        for work in works:
-            work.wait.assert_called_once_with(timeout)
+        self.assertEqual(wait.call_args_list, [call(work, timeout) for work in works])
 
     def test_xpu_probe_failure_points_at_xccl(self):
         with patch.object(spg.dist, "all_reduce", side_effect=RuntimeError("ze error")):

@@ -408,12 +408,30 @@ def run_collective(op, *args, timeout=None, **kwargs):
     try:
         if timeout is None:
             return op(*args, **kwargs)
-        work = op(*args, async_op=True, **kwargs)
-        work.wait(timeout)
+        wait_work(op(*args, async_op=True, **kwargs), timeout)
         return None
     finally:
         if monitor is not None:
             monitor.active = None
+
+
+def wait_work(work, timeout):
+    """Block until `work` completes or `timeout` expires, polling at sub-millisecond intervals.
+
+    PyTorch XCCL's Work.wait(timeout) sleeps 10 ms between completion checks, rounding every
+    exchange up to 10 ms; on two B70s with P2P an even 115 MB all-to-all takes only 2.9 ms.
+    """
+    start = time.monotonic()
+    deadline = start + timeout.total_seconds()
+    delay = 2e-5
+    while not work.is_completed():
+        now = time.monotonic()
+        if now >= deadline:
+            work.wait(timeout)  # raises PyTorch's own timeout error unless the work just finished
+            return
+        time.sleep(min(delay, deadline - now))
+        delay = min(delay * 2, 2e-4 if now - start < 1 else 1e-2)
+    work.wait()
 
 
 def all_gather_single_op():
@@ -476,14 +494,23 @@ def _column_chunks(columns, rows, slot_numel):
         yield start, min(start + width, columns)
 
 
+def _peer_rows(t, splits):
+    """Per-peer [rows, C] views of `t`, whose leading dims flatten to rows in peer order."""
+    if t.dim() == 3 and t.shape[0] == len(splits) and all(n == t.shape[1] for n in splits):
+        return list(t.unbind(0))
+    return list((t if t.dim() == 2 else t.view(-1, t.shape[-1])).split(list(splits)))
+
+
 def all_to_all_rows(out, send, out_splits, in_splits, group, timeout=None, max_rows=None):
     """all_to_all_single along rows of [..., C] tensors; leading dims flatten to rows.
 
     Split sizes count rows. `max_rows` must be identical on every rank (it fixes the
     column chunking when staging); `out` and `send` may be non-contiguous views.
+    When staging uneven splits, the largest split must also be identical on every rank.
     """
     columns = send.shape[-1]
     rows_in, rows_out = send.numel() // max(columns, 1), out.numel() // max(columns, 1)
+    out_splits, in_splits = list(out_splits), list(in_splits)
     slots = comm_slots(send.device, send.dtype)
     if slots is None:
         source = send.reshape(rows_in, columns)
@@ -491,22 +518,41 @@ def all_to_all_rows(out, send, out_splits, in_splits, group, timeout=None, max_r
         target = out.view(rows_out, columns) if direct else torch.empty(
             (rows_out, columns), dtype=out.dtype, device=out.device)
         run_collective(dist.all_to_all_single, target, source.contiguous(),
-                       output_split_sizes=list(out_splits), input_split_sizes=list(in_splits),
+                       output_split_sizes=out_splits, input_split_sizes=in_splits,
                        group=group, timeout=timeout)
         if not direct:
             out.copy_(target.view(out.shape))
         return out
     send_slot, recv_slot = slots
+    world = len(out_splits)
+    block = max(out_splits + in_splits)
+    # Uneven splits (odd sequence length) take XCCL's grouped send/recv path, which is
+    # ~6x slower than an even exchange on B70 without GPU P2P; pad every peer to `block` rows.
+    padded = any(n != block for n in out_splits + in_splits)
+    if padded:
+        send_parts, out_parts = _peer_rows(send, in_splits), _peer_rows(out, out_splits)
+        rows_in = rows_out = world * block
     rows = max(max_rows or 0, rows_in, rows_out)
     for start, stop in _column_chunks(columns, rows, send_slot.numel()):
         width = stop - start
-        staged_send = send_slot[:rows_in * width].view(*send.shape[:-1], width)
-        staged_send.copy_(send[..., start:stop])
-        staged_recv = recv_slot[:rows_out * width].view(rows_out, width)
-        run_collective(dist.all_to_all_single, staged_recv, staged_send.view(rows_in, width),
-                       output_split_sizes=list(out_splits), input_split_sizes=list(in_splits),
-                       group=group, timeout=timeout)
-        out[..., start:stop].copy_(staged_recv.view(*out.shape[:-1], width))
+        if padded:
+            staged_send = send_slot[:rows_in * width].view(world, block, width)
+            for peer, part in enumerate(send_parts):
+                staged_send[peer, :part.shape[0]].copy_(part[:, start:stop])
+            staged_recv = recv_slot[:rows_out * width].view(world, block, width)
+            run_collective(dist.all_to_all_single, staged_recv.view(rows_out, width),
+                           staged_send.view(rows_in, width), output_split_sizes=[block] * world,
+                           input_split_sizes=[block] * world, group=group, timeout=timeout)
+            for peer, part in enumerate(out_parts):
+                part[:, start:stop].copy_(staged_recv[peer, :part.shape[0]])
+        else:
+            staged_send = send_slot[:rows_in * width].view(*send.shape[:-1], width)
+            staged_send.copy_(send[..., start:stop])
+            staged_recv = recv_slot[:rows_out * width].view(rows_out, width)
+            run_collective(dist.all_to_all_single, staged_recv, staged_send.view(rows_in, width),
+                           output_split_sizes=out_splits, input_split_sizes=in_splits,
+                           group=group, timeout=timeout)
+            out[..., start:stop].copy_(staged_recv.view(*out.shape[:-1], width))
     return out
 
 
