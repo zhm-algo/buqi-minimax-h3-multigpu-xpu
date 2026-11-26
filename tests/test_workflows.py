@@ -13,6 +13,12 @@ WORKFLOWS = {
     "i2v_first_last": "workflow_api_i2v_first_last_2gpu.json",
     "r2v": "workflow_api_r2v_2gpu.json",
 }
+FOUR_GPU_WORKFLOWS = {
+    "t2v": "workflow_api_t2v_4gpu.json",
+    "i2v_first": "workflow_api_i2v_4gpu.json",
+    "i2v_first_last": "workflow_api_i2v_first_last_4gpu.json",
+    "r2v": "workflow_api_r2v_4gpu.json",
+}
 TURBO_WORKFLOWS = {
     "t2v": "workflow_api_t2v_turbo_lora_2gpu.json",
     "i2v_first": "workflow_api_i2v_turbo_lora_2gpu.json",
@@ -36,33 +42,47 @@ class WorkflowTests(unittest.TestCase):
         return next(link[1] for link in workflow["links"] if link[0] == link_id)
 
     def test_examples_use_sp_loader_and_standard_vae_decode(self):
-        for label, filename in [*WORKFLOWS.items(), *(("turbo_" + k, v) for k, v in TURBO_WORKFLOWS.items())]:
-            with self.subTest(workflow=label):
-                workflow = self.load(filename)
-                types = [node["type"] for node in workflow["nodes"]]
-                self.assertIn("MiniMaxH3SPUNETLoader", types)
-                self.assertNotIn("UNETLoader", types)
-                loader = self.node(workflow, "unet")
-                self.assertIn("int8_convrot", loader["widgets_values"][0])
-                self.assertEqual(loader["widgets_values"][1:], ["default", 2, "auto"])
-                self.assertEqual(self.node(workflow, "vae_video")["widgets_values"][0],
-                                 "minimax_h3_video_vae_int8_convrot.safetensors")
-                self.assertEqual(self.node(workflow, "decode_video")["type"], "VAEDecode")
-                self.assert_links_are_consistent(workflow)
+        for world_size, workflows in ((2, WORKFLOWS), (4, FOUR_GPU_WORKFLOWS), (2, TURBO_WORKFLOWS)):
+            for filename in workflows.values():
+                with self.subTest(workflow=filename):
+                    workflow = self.load(filename)
+                    types = [node["type"] for node in workflow["nodes"]]
+                    self.assertIn("MiniMaxH3SPUNETLoader", types)
+                    self.assertNotIn("UNETLoader", types)
+                    loader = self.node(workflow, "unet")
+                    self.assertIn("int8_convrot", loader["widgets_values"][0])
+                    self.assertEqual(loader["widgets_values"][1:], ["default", world_size, "auto"])
+                    self.assertEqual(self.node(workflow, "vae_video")["widgets_values"][0],
+                                     "minimax_h3_video_vae_int8_convrot.safetensors")
+                    self.assertEqual(self.node(workflow, "decode_video")["type"], "VAEDecode")
+                    self.assert_links_are_consistent(workflow)
 
     def test_required_variants_are_distinct(self):
-        t2v = self.linked_inputs(self.node(self.load(WORKFLOWS["t2v"]), "conditioning"))
-        self.assertNotIn("first_frame", t2v)
-        first = self.linked_inputs(self.node(self.load(WORKFLOWS["i2v_first"]), "conditioning"))
-        self.assertIn("first_frame", first)
-        self.assertNotIn("last_frame", first)
-        first_last = self.linked_inputs(
-            self.node(self.load(WORKFLOWS["i2v_first_last"]), "conditioning"))
-        self.assertIn("first_frame", first_last)
-        self.assertIn("last_frame", first_last)
-        r2v = self.node(self.load(WORKFLOWS["r2v"]), "conditioning")
-        self.assertEqual(r2v["type"], "MiniMaxH3ReferenceToVideo")
-        self.assertIn("ref_images.ref_image_0", self.linked_inputs(r2v))
+        frames = {"t2v": set(), "i2v_first": {"first_frame"},
+                  "i2v_first_last": {"first_frame", "last_frame"}}
+        for workflows in (WORKFLOWS, FOUR_GPU_WORKFLOWS):
+            for label, expected in frames.items():
+                with self.subTest(workflow=workflows[label]):
+                    conditioning = self.linked_inputs(
+                        self.node(self.load(workflows[label]), "conditioning"))
+                    self.assertEqual(conditioning & {"first_frame", "last_frame"}, expected)
+            with self.subTest(workflow=workflows["r2v"]):
+                r2v = self.node(self.load(workflows["r2v"]), "conditioning")
+                self.assertEqual(r2v["type"], "MiniMaxH3ReferenceToVideo")
+                self.assertIn("ref_images.ref_image_0", self.linked_inputs(r2v))
+                self.assertIn("ref_images.ref_image_1", self.linked_inputs(r2v))
+
+    def test_four_gpu_duration_and_resolution_controls_are_connected(self):
+        for filename in FOUR_GPU_WORKFLOWS.values():
+            with self.subTest(workflow=filename):
+                workflow = self.load(filename)
+                conditioning = self.node(workflow, "conditioning")
+                links = {link[0]: link for link in workflow["links"]}
+                inputs = {item["name"]: item["link"] for item in conditioning["inputs"]}
+                self.assertEqual(links[inputs["width"]][1:3], [3, 0])
+                self.assertEqual(links[inputs["height"]][1:3], [3, 1])
+                self.assertEqual(links[inputs["length"]][1:3], [2, 1])
+                self.assertEqual(self.source(workflow, self.node(workflow, 2), "values.a"), 1)
 
     def test_turbo_variants_sample_through_the_lora(self):
         frames = {"t2v": set(), "i2v_first": {"first_frame"},

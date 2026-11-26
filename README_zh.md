@@ -148,11 +148,15 @@ COMFYUI_ROOT=/path/to/ComfyUI torchrun --standalone --nproc-per-node=2 \
 | [`examples/workflow_api_i2v_2gpu.json`](examples/workflow_api_i2v_2gpu.json) | UI：I2V first |
 | [`examples/workflow_api_i2v_first_last_2gpu.json`](examples/workflow_api_i2v_first_last_2gpu.json) | UI：I2V first+last |
 | [`examples/workflow_api_r2v_2gpu.json`](examples/workflow_api_r2v_2gpu.json) | UI：R2V（两张参考图） |
+| [`examples/workflow_api_t2v_4gpu.json`](examples/workflow_api_t2v_4gpu.json) | UI：四卡 T2V |
+| [`examples/workflow_api_i2v_4gpu.json`](examples/workflow_api_i2v_4gpu.json) | UI：四卡 I2V first |
+| [`examples/workflow_api_i2v_first_last_4gpu.json`](examples/workflow_api_i2v_first_last_4gpu.json) | UI：四卡 I2V first+last |
+| [`examples/workflow_api_r2v_4gpu.json`](examples/workflow_api_r2v_4gpu.json) | UI：四卡 R2V（两张参考图） |
 | [`examples/workflow_api_t2v_turbo_lora_2gpu.json`](examples/workflow_api_t2v_turbo_lora_2gpu.json) | UI：T2V + 静态 8-step Turbo LoRA |
 | [`examples/workflow_api_i2v_turbo_lora_2gpu.json`](examples/workflow_api_i2v_turbo_lora_2gpu.json) | UI：I2V first + 静态 8-step Turbo LoRA |
 | [`examples/workflow_api_i2v_first_last_turbo_lora_2gpu.json`](examples/workflow_api_i2v_first_last_turbo_lora_2gpu.json) | UI：I2V first+last + 静态 8-step Turbo LoRA |
 
-所有示例都是 ComfyUI UI 工作流（拖入 ComfyUI 或通过 **Open** 打开），使用 `MiniMaxH3SPUNETLoader`，`world_size=2`、`devices=auto`，已在两张 Intel Arc Pro B70 上验证。需要 API 格式时，打开工作流后启用 ComfyUI Developer Mode，再使用 **Save (API Format)** 导出。
+所有示例都是 ComfyUI UI 工作流（拖入 ComfyUI 或通过 **Open** 打开），使用 `MiniMaxH3SPUNETLoader` 和 `devices=auto`。`_2gpu.json` 示例设置 `world_size=2`，`_4gpu.json` 示例设置 `world_size=4`。启动 ComfyUI 时应暴露对应数量的 GPU；四张 B70 使用 `ZE_AFFINITY_MASK=0,1,2,3 MINIMAX_SP_DEVICES=0,1,2,3`。需要 API 格式时，打开工作流后启用 ComfyUI Developer Mode，再使用 **Save (API Format)** 导出。
 
 `LoadImage` 节点中的图片名来自验证环境，仓库未附带这些图片。请把自己的文件放进 `ComfyUI/input` 并在运行前重新选择。
 

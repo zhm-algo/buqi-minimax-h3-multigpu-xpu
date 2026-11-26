@@ -154,11 +154,15 @@ The manual GPU acceptance workflow runs the same steps with `backend=xpu` on a s
 | [`examples/workflow_api_i2v_2gpu.json`](examples/workflow_api_i2v_2gpu.json) | UI | First-frame I2V |
 | [`examples/workflow_api_i2v_first_last_2gpu.json`](examples/workflow_api_i2v_first_last_2gpu.json) | UI | First+last-frame I2V |
 | [`examples/workflow_api_r2v_2gpu.json`](examples/workflow_api_r2v_2gpu.json) | UI | R2V with two reference images |
+| [`examples/workflow_api_t2v_4gpu.json`](examples/workflow_api_t2v_4gpu.json) | UI | Four-GPU T2V |
+| [`examples/workflow_api_i2v_4gpu.json`](examples/workflow_api_i2v_4gpu.json) | UI | Four-GPU first-frame I2V |
+| [`examples/workflow_api_i2v_first_last_4gpu.json`](examples/workflow_api_i2v_first_last_4gpu.json) | UI | Four-GPU first+last-frame I2V |
+| [`examples/workflow_api_r2v_4gpu.json`](examples/workflow_api_r2v_4gpu.json) | UI | Four-GPU R2V with two reference images |
 | [`examples/workflow_api_t2v_turbo_lora_2gpu.json`](examples/workflow_api_t2v_turbo_lora_2gpu.json) | UI | T2V with the static 8-step Turbo LoRA |
 | [`examples/workflow_api_i2v_turbo_lora_2gpu.json`](examples/workflow_api_i2v_turbo_lora_2gpu.json) | UI | First-frame I2V with the static 8-step Turbo LoRA |
 | [`examples/workflow_api_i2v_first_last_turbo_lora_2gpu.json`](examples/workflow_api_i2v_first_last_turbo_lora_2gpu.json) | UI | First+last-frame I2V with the static 8-step Turbo LoRA |
 
-All examples are ComfyUI UI graphs (load them by dragging into ComfyUI or via **Open**) that use `MiniMaxH3SPUNETLoader` with `world_size=2` and `devices=auto`, and were validated on two Intel Arc Pro B70 cards. For an API graph, open the workflow, enable ComfyUI Developer Mode, then use **Save (API Format)**.
+All examples are ComfyUI UI graphs (load them by dragging into ComfyUI or via **Open**) that use `MiniMaxH3SPUNETLoader` with `devices=auto`. The `_2gpu.json` examples set `world_size=2`; the `_4gpu.json` examples set `world_size=4`. Expose the matching number of GPUs; for four B70s, use `ZE_AFFINITY_MASK=0,1,2,3 MINIMAX_SP_DEVICES=0,1,2,3` when starting ComfyUI. For an API graph, open the workflow, enable ComfyUI Developer Mode, then use **Save (API Format)**.
 
 The `LoadImage` nodes name images from the validation setup that are not shipped with this repository. Put your own files in `ComfyUI/input` and select them before running.
 
